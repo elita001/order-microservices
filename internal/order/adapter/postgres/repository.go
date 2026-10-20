@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/elita001/order-microservices/internal/order/domain"
+	"github.com/elita001/order-microservices/pkg/outbox"
 )
 
 type Repository struct {
@@ -21,7 +22,13 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-func (r *Repository) Create(ctx context.Context, order *domain.Order) error {
+// Create saves the order, its items, and its events to the outbox in one transaction.
+func (r *Repository) Create(ctx context.Context, order *domain.Order, domainEvents ...domain.Event) error {
+	msgs, err := toOutboxMessages(domainEvents)
+	if err != nil {
+		return err
+	}
+
 	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO orders (id, customer_id, status, total_amount, currency, created_at, updated_at)
@@ -41,7 +48,7 @@ func (r *Repository) Create(ctx context.Context, order *domain.Order) error {
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return fmt.Errorf("insert order items: %w", err)
 		}
-		return nil
+		return outbox.Store(ctx, tx, msgs...)
 	})
 }
 

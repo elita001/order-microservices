@@ -23,7 +23,9 @@ var supportedCurrencies = map[string]struct{}{"RUB": {}, "USD": {}, "EUR": {}}
 
 // Repository is the persistence port required by the order use cases.
 type Repository interface {
-	Create(ctx context.Context, order *domain.Order) error
+	// Create persists the order together with its events in one transaction,
+	// so an event is published if and only if the order is saved.
+	Create(ctx context.Context, order *domain.Order, events ...domain.Event) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, error)
 	ListByCustomer(ctx context.Context, customerID uuid.UUID, limit, offset int) ([]domain.Order, error)
 }
@@ -87,7 +89,7 @@ func (s *Service) Create(ctx context.Context, in CreateOrderInput) (*domain.Orde
 		UpdatedAt:   now,
 	}
 
-	if err := s.repo.Create(ctx, order); err != nil {
+	if err := s.repo.Create(ctx, order, domain.NewOrderCreated(order)); err != nil {
 		return nil, fmt.Errorf("create order: %w", err)
 	}
 

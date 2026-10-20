@@ -1,4 +1,4 @@
-.PHONY: up down logs ps test tidy migrate-new
+.PHONY: up down logs ps test tidy migrate-new outbox
 
 up:            ## build and start everything
 	docker compose up -d --build
@@ -11,6 +11,10 @@ logs:
 
 ps:
 	docker compose ps
+
+outbox:        ## show the latest outbox messages
+	docker compose exec postgres psql -U app -d orderflow -c \
+		"SELECT id, event_type, aggregate_id, attempts, published_at, last_error FROM outbox ORDER BY created_at DESC LIMIT 20"
 
 test:
 	go test -race -count=1 ./...

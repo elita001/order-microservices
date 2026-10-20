@@ -13,6 +13,7 @@ import (
 	"github.com/caarlos0/env/v11"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"golang.org/x/sync/errgroup"
 
 	orderhttp "github.com/elita001/order-microservices/internal/order/adapter/http"
 	orderpostgres "github.com/elita001/order-microservices/internal/order/adapter/postgres"
@@ -20,7 +21,9 @@ import (
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/outbox"
 	"github.com/elita001/order-microservices/pkg/postgres"
+	"github.com/elita001/order-microservices/pkg/rabbitmq"
 )
 
 type config struct {
@@ -28,6 +31,21 @@ type config struct {
 	PostgresDSN     string        `env:"POSTGRES_DSN,required"`
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
+
+	RabbitMQURL      string `env:"RABBITMQ_URL,required"`
+	RabbitMQExchange string `env:"RABBITMQ_EXCHANGE" envDefault:"orderflow.events"`
+
+	Outbox outboxConfig `envPrefix:"OUTBOX_"`
+}
+
+type outboxConfig struct {
+	BatchSize       int           `env:"BATCH_SIZE" envDefault:"100"`
+	PollInterval    time.Duration `env:"POLL_INTERVAL" envDefault:"1s"`
+	MaxBackoff      time.Duration `env:"MAX_BACKOFF" envDefault:"30s"`
+	PublishTimeout  time.Duration `env:"PUBLISH_TIMEOUT" envDefault:"5s"`
+	BatchTimeout    time.Duration `env:"BATCH_TIMEOUT" envDefault:"8s"`
+	Retention       time.Duration `env:"RETENTION" envDefault:"168h"`
+	CleanupInterval time.Duration `env:"CLEANUP_INTERVAL" envDefault:"1h"`
 }
 
 func main() {
@@ -55,6 +73,19 @@ func run() error {
 		return fmt.Errorf("connect postgres: %w", err)
 	}
 	defer pool.Close()
+
+	publisher := rabbitmq.NewPublisher(cfg.RabbitMQURL, cfg.RabbitMQExchange, "order-service", log)
+	defer publisher.Close()
+
+	relay := outbox.NewRelay(pool, publisher, outbox.RelayConfig{
+		BatchSize:       cfg.Outbox.BatchSize,
+		PollInterval:    cfg.Outbox.PollInterval,
+		MaxBackoff:      cfg.Outbox.MaxBackoff,
+		PublishTimeout:  cfg.Outbox.PublishTimeout,
+		BatchTimeout:    cfg.Outbox.BatchTimeout,
+		Retention:       cfg.Outbox.Retention,
+		CleanupInterval: cfg.Outbox.CleanupInterval,
+	}, log)
 
 	repo := orderpostgres.NewRepository(pool)
 	svc := application.NewService(repo, log)
@@ -87,5 +118,10 @@ func run() error {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	return httpserver.Run(ctx, srv, cfg.ShutdownTimeout, log)
+
+	// The HTTP server and the outbox relay stop together: on a signal or when either fails.
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return httpserver.Run(gctx, srv, cfg.ShutdownTimeout, log) })
+	g.Go(func() error { return relay.Run(gctx) })
+	return g.Wait()
 }

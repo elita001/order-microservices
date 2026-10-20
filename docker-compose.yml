@@ -15,6 +15,24 @@ services:
       timeout: 3s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:4.1-management-alpine
+    # A fixed hostname keeps the node name stable, otherwise data in the volume is lost on recreate.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    ports:
+      - "5672:5672"
+      - "15672:15672" # management UI: http://localhost:15672 (app/app)
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   migrate:
     image: migrate/migrate:v4.17.1
     volumes:
@@ -32,6 +50,7 @@ services:
     environment:
       HTTP_ADDR: ":8081"
       POSTGRES_DSN: "postgres://app:app@postgres:5432/orderflow?sslmode=disable"
+      RABBITMQ_URL: "amqp://app:app@rabbitmq:5672/"
       LOG_LEVEL: debug
     ports:
       - "8081:8081"
@@ -43,7 +62,12 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      # Not strictly required: thanks to the outbox, orders are accepted even while
+      # RabbitMQ is down. Waiting only keeps startup logs clean.
+      rabbitmq:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   pgdata:
+  rabbitmqdata:

@@ -12,13 +12,15 @@ import (
 
 type fakeRepo struct {
 	created   *domain.Order
+	events    []domain.Event
 	err       error
 	gotLimit  int
 	gotOffset int
 }
 
-func (f *fakeRepo) Create(_ context.Context, order *domain.Order) error {
+func (f *fakeRepo) Create(_ context.Context, order *domain.Order, events ...domain.Event) error {
 	f.created = order
+	f.events = events
 	return f.err
 }
 
@@ -64,6 +66,24 @@ func TestService_Create_CalculatesTotal(t *testing.T) {
 	}
 	if repo.created == nil {
 		t.Error("order was not saved")
+	}
+}
+
+func TestService_Create_SavesOrderCreatedEvent(t *testing.T) {
+	repo := &fakeRepo{}
+	order, err := newTestService(repo).Create(context.Background(), validInput())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(repo.events) != 1 {
+		t.Fatalf("got %d events, want 1", len(repo.events))
+	}
+	event, ok := repo.events[0].(domain.OrderCreated)
+	if !ok {
+		t.Fatalf("event is %T, want domain.OrderCreated", repo.events[0])
+	}
+	if event.OrderID != order.ID || event.TotalAmount != order.TotalAmount {
+		t.Errorf("event %+v does not match order %+v", event, order)
 	}
 }
 
