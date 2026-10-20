@@ -14,13 +14,21 @@ A microservices system for placing and processing orders, written in Go.
 ## Running
 
 ```bash
-go mod tidy   # run once to download dependencies and create go.sum
 make up
 ```
 
+On the first run `make up` copies `.env.example` to `.env`. Edit `.env` to change
+passwords or host ports (e.g., if `5432` is already taken); it is ignored by git.
+Running `docker compose` directly without `.env` fails with a hint to create it.
+
+Configuration follows the 12-factor approach: services read settings only from
+environment variables and contain no secrets or credentials. `.env` is for local
+development only; in production, values come from the platform (Kubernetes Secrets,
+Vault, CI/CD variables).
+
 Management UIs:
 
-- RabbitMQ: http://localhost:15672 (`app` / `app`)
+- RabbitMQ: http://localhost:15672 (credentials `RABBITMQ_USER` / `RABBITMQ_PASSWORD` from `.env`, `app` / `app` by default)
 
 ## Example requests
 
@@ -68,7 +76,8 @@ unique `message_id` (UUIDv7) that consumers use for deduplication.
 ### Watching events locally
 
 No service consumes events yet, so RabbitMQ drops them. To see them, bind a debug queue
-(the exchange is declared on the first publish, so create one order first):
+(the exchange is declared on the first publish, so create one order first; the
+commands use the default credentials from `.env.example`):
 
 ```bash
 curl -u app:app -X PUT localhost:15672/api/queues/%2F/debug.events \

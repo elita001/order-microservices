@@ -1,16 +1,19 @@
+# Local development environment. Values come from .env (see .env.example);
+# compose fails with a clear message if a required variable is missing.
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: orderflow
+      POSTGRES_USER: ${POSTGRES_USER:?copy .env.example to .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      POSTGRES_DB: ${POSTGRES_DB:?copy .env.example to .env}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U app -d orderflow"]
+      # $$ defers expansion to the container shell, which has these variables.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -20,11 +23,11 @@ services:
     # A fixed hostname keeps the node name stable, otherwise data in the volume is lost on recreate.
     hostname: rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: app
-      RABBITMQ_DEFAULT_PASS: app
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?copy .env.example to .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?copy .env.example to .env}
     ports:
-      - "5672:5672"
-      - "15672:15672" # management UI: http://localhost:15672 (app/app)
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_UI_PORT:-15672}:15672" # management UI
     volumes:
       - rabbitmqdata:/var/lib/rabbitmq
     healthcheck:
@@ -37,7 +40,10 @@ services:
     image: migrate/migrate:v4.17.1
     volumes:
       - ./migrations:/migrations
-    command: ["-path=/migrations", "-database=postgres://app:app@postgres:5432/orderflow?sslmode=disable", "up"]
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      - "up"
     depends_on:
       postgres:
         condition: service_healthy
@@ -49,11 +55,11 @@ services:
         SERVICE: order
     environment:
       HTTP_ADDR: ":8081"
-      POSTGRES_DSN: "postgres://app:app@postgres:5432/orderflow?sslmode=disable"
-      RABBITMQ_URL: "amqp://app:app@rabbitmq:5672/"
-      LOG_LEVEL: debug
+      POSTGRES_DSN: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+      RABBITMQ_URL: "amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
-      - "8081:8081"
+      - "${ORDER_HTTP_PORT:-8081}:8081"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8081/readyz"]
       interval: 10s
