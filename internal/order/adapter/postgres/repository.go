@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -13,6 +14,9 @@ import (
 	"github.com/elita001/order-microservices/internal/order/domain"
 	"github.com/elita001/order-microservices/pkg/outbox"
 )
+
+// OutboxTable is the order service's outbox table.
+const OutboxTable = "order_outbox"
 
 type Repository struct {
 	pool *pgxpool.Pool
@@ -48,7 +52,7 @@ func (r *Repository) Create(ctx context.Context, order *domain.Order, domainEven
 		if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 			return fmt.Errorf("insert order items: %w", err)
 		}
-		return outbox.Store(ctx, tx, msgs...)
+		return outbox.Store(ctx, tx, OutboxTable, msgs...)
 	})
 }
 
@@ -107,4 +111,18 @@ func (r *Repository) ListByCustomer(ctx context.Context, customerID uuid.UUID, l
 		return nil, fmt.Errorf("scan orders: %w", err)
 	}
 	return orders, rows.Err()
+}
+
+// UpdateStatus changes the status only if the order is currently in the from status.
+// The check and the update are one statement, so concurrent or repeated updates are safe.
+// It returns false if the order does not exist or is in a different status.
+func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domain.Status, updatedAt time.Time) (bool, error) {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE orders SET status = $3, updated_at = $4
+		WHERE id = $1 AND status = $2`,
+		id, string(from), string(to), updatedAt)
+	if err != nil {
+		return false, fmt.Errorf("update order status: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }

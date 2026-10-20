@@ -17,14 +17,15 @@ type Publisher interface {
 	Publish(ctx context.Context, msg Message) error
 }
 
+// RelayConfig is usually loaded from environment variables with the OUTBOX_ prefix.
 type RelayConfig struct {
-	BatchSize       int           // messages locked and published per transaction
-	PollInterval    time.Duration // pause between polls when the outbox is empty
-	MaxBackoff      time.Duration // upper bound for the pause after failures
-	PublishTimeout  time.Duration // per message, including the broker confirm
-	BatchTimeout    time.Duration // a started batch is finished even during shutdown
-	Retention       time.Duration // how long published messages are kept for debugging
-	CleanupInterval time.Duration
+	BatchSize       int           `env:"BATCH_SIZE" envDefault:"100"`     // messages locked and published per transaction
+	PollInterval    time.Duration `env:"POLL_INTERVAL" envDefault:"1s"`   // pause between polls when the outbox is empty
+	MaxBackoff      time.Duration `env:"MAX_BACKOFF" envDefault:"30s"`    // upper bound for the pause after failures
+	PublishTimeout  time.Duration `env:"PUBLISH_TIMEOUT" envDefault:"5s"` // per message, including the broker confirm
+	BatchTimeout    time.Duration `env:"BATCH_TIMEOUT" envDefault:"8s"`   // a started batch is finished even during shutdown
+	Retention       time.Duration `env:"RETENTION" envDefault:"168h"`     // how long published messages are kept for debugging
+	CleanupInterval time.Duration `env:"CLEANUP_INTERVAL" envDefault:"1h"`
 }
 
 // Relay moves messages from the outbox table to the broker.
@@ -34,13 +35,20 @@ type RelayConfig struct {
 // crashes in between, the message is sent again (at-least-once).
 type Relay struct {
 	pool      *pgxpool.Pool
+	table     string // sanitized identifier, safe to put into queries
 	publisher Publisher
 	cfg       RelayConfig
 	log       *slog.Logger
 }
 
-func NewRelay(pool *pgxpool.Pool, publisher Publisher, cfg RelayConfig, log *slog.Logger) *Relay {
-	return &Relay{pool: pool, publisher: publisher, cfg: cfg, log: log.With("component", "outbox_relay")}
+func NewRelay(pool *pgxpool.Pool, table string, publisher Publisher, cfg RelayConfig, log *slog.Logger) *Relay {
+	return &Relay{
+		pool:      pool,
+		table:     pgx.Identifier{table}.Sanitize(),
+		publisher: publisher,
+		cfg:       cfg,
+		log:       log.With("component", "outbox_relay", "table", table),
+	}
 }
 
 // Run polls the outbox until ctx is canceled. Failures are logged and retried with
@@ -102,13 +110,13 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
 
-	rows, err := tx.Query(ctx, `
+	rows, err := tx.Query(ctx, fmt.Sprintf(`
 		SELECT id, aggregate_type, aggregate_id, event_type, payload, created_at
-		FROM outbox
+		FROM %s
 		WHERE published_at IS NULL
 		ORDER BY created_at, id
 		LIMIT $1
-		FOR UPDATE SKIP LOCKED`, r.cfg.BatchSize)
+		FOR UPDATE SKIP LOCKED`, r.table), r.cfg.BatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("select messages: %w", err)
 	}
@@ -134,8 +142,8 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 			// Stop at the first failure: the broker is most likely unavailable,
 			// and continuing would also break the order of events.
 			publishErr = fmt.Errorf("publish message %s (%s): %w", msg.ID, msg.EventType, err)
-			if _, err := tx.Exec(ctx, `
-				UPDATE outbox SET attempts = attempts + 1, last_error = $2 WHERE id = $1`,
+			if _, err := tx.Exec(ctx, fmt.Sprintf(`
+				UPDATE %s SET attempts = attempts + 1, last_error = $2 WHERE id = $1`, r.table),
 				msg.ID, publishErr.Error()); err != nil {
 				return 0, errors.Join(publishErr, fmt.Errorf("record failure: %w", err))
 			}
@@ -145,7 +153,7 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 	}
 
 	if len(published) > 0 {
-		if _, err := tx.Exec(ctx, `UPDATE outbox SET published_at = now() WHERE id = ANY($1)`, published); err != nil {
+		if _, err := tx.Exec(ctx, fmt.Sprintf(`UPDATE %s SET published_at = now() WHERE id = ANY($1)`, r.table), published); err != nil {
 			return 0, errors.Join(publishErr, fmt.Errorf("mark published: %w", err))
 		}
 	}
@@ -165,10 +173,10 @@ func (r *Relay) cleanup(ctx context.Context) {
 	cutoff := time.Now().Add(-r.cfg.Retention)
 	var total int64
 	for ctx.Err() == nil {
-		tag, err := r.pool.Exec(ctx, `
-			DELETE FROM outbox WHERE id IN (
-				SELECT id FROM outbox WHERE published_at < $1 LIMIT $2
-			)`, cutoff, chunk)
+		tag, err := r.pool.Exec(ctx, fmt.Sprintf(`
+			DELETE FROM %[1]s WHERE id IN (
+				SELECT id FROM %[1]s WHERE published_at < $1 LIMIT $2
+			)`, r.table), cutoff, chunk)
 		if err != nil {
 			r.log.Error("outbox cleanup failed", "error", err)
 			return

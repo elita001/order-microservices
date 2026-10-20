@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -16,6 +17,8 @@ type fakeRepo struct {
 	err       error
 	gotLimit  int
 	gotOffset int
+
+	statuses map[uuid.UUID]domain.Status
 }
 
 func (f *fakeRepo) Create(_ context.Context, order *domain.Order, events ...domain.Event) error {
@@ -31,6 +34,17 @@ func (f *fakeRepo) GetByID(_ context.Context, _ uuid.UUID) (*domain.Order, error
 func (f *fakeRepo) ListByCustomer(_ context.Context, _ uuid.UUID, limit, offset int) ([]domain.Order, error) {
 	f.gotLimit, f.gotOffset = limit, offset
 	return []domain.Order{}, f.err
+}
+
+func (f *fakeRepo) UpdateStatus(_ context.Context, id uuid.UUID, from, to domain.Status, _ time.Time) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	if current, ok := f.statuses[id]; !ok || current != from {
+		return false, nil
+	}
+	f.statuses[id] = to
+	return true, nil
 }
 
 type discardLogger struct{}
@@ -139,5 +153,50 @@ func TestService_ListByCustomer_Limit(t *testing.T) {
 				t.Errorf("limit: repo=%d result=%d, want %d", repo.gotLimit, result.Limit, tt.wantLimit)
 			}
 		})
+	}
+}
+
+func TestService_CompletePayment(t *testing.T) {
+	tests := []struct {
+		name       string
+		current    domain.Status
+		succeeded  bool
+		wantStatus domain.Status
+	}{
+		{"succeeded", domain.StatusPending, true, domain.StatusPaid},
+		{"failed", domain.StatusPending, false, domain.StatusPaymentFailed},
+		{"duplicate event is ignored", domain.StatusPaid, false, domain.StatusPaid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := uuid.New()
+			repo := &fakeRepo{statuses: map[uuid.UUID]domain.Status{id: tt.current}}
+			err := newTestService(repo).CompletePayment(context.Background(),
+				CompletePaymentInput{OrderID: id, Succeeded: tt.succeeded})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := repo.statuses[id]; got != tt.wantStatus {
+				t.Errorf("status = %q, want %q", got, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestService_CompletePayment_UnknownOrderIsIgnored(t *testing.T) {
+	repo := &fakeRepo{statuses: map[uuid.UUID]domain.Status{}}
+	err := newTestService(repo).CompletePayment(context.Background(),
+		CompletePaymentInput{OrderID: uuid.New(), Succeeded: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestService_CompletePayment_RepoErrorIsReturned(t *testing.T) {
+	dbErr := errors.New("db is down")
+	err := newTestService(&fakeRepo{err: dbErr}).CompletePayment(context.Background(),
+		CompletePaymentInput{OrderID: uuid.New(), Succeeded: true})
+	if !errors.Is(err, dbErr) {
+		t.Fatalf("expected wrapped db error, got %v", err)
 	}
 }

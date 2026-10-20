@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	orderhttp "github.com/elita001/order-microservices/internal/order/adapter/http"
+	ordermessaging "github.com/elita001/order-microservices/internal/order/adapter/messaging"
 	orderpostgres "github.com/elita001/order-microservices/internal/order/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/order/application"
 	"github.com/elita001/order-microservices/pkg/httpserver"
@@ -26,6 +27,8 @@ import (
 	"github.com/elita001/order-microservices/pkg/rabbitmq"
 )
 
+const serviceName = "order-service"
+
 type config struct {
 	HTTPAddr        string        `env:"HTTP_ADDR" envDefault:":8081"`
 	PostgresDSN     string        `env:"POSTGRES_DSN,required"`
@@ -34,18 +37,10 @@ type config struct {
 
 	RabbitMQURL      string `env:"RABBITMQ_URL,required"`
 	RabbitMQExchange string `env:"RABBITMQ_EXCHANGE" envDefault:"orderflow.events"`
+	RabbitMQQueue    string `env:"RABBITMQ_QUEUE" envDefault:"order-service"`
 
-	Outbox outboxConfig `envPrefix:"OUTBOX_"`
-}
-
-type outboxConfig struct {
-	BatchSize       int           `env:"BATCH_SIZE" envDefault:"100"`
-	PollInterval    time.Duration `env:"POLL_INTERVAL" envDefault:"1s"`
-	MaxBackoff      time.Duration `env:"MAX_BACKOFF" envDefault:"30s"`
-	PublishTimeout  time.Duration `env:"PUBLISH_TIMEOUT" envDefault:"5s"`
-	BatchTimeout    time.Duration `env:"BATCH_TIMEOUT" envDefault:"8s"`
-	Retention       time.Duration `env:"RETENTION" envDefault:"168h"`
-	CleanupInterval time.Duration `env:"CLEANUP_INTERVAL" envDefault:"1h"`
+	Outbox   outbox.RelayConfig      `envPrefix:"OUTBOX_"`
+	Consumer rabbitmq.ConsumerConfig `envPrefix:"CONSUMER_"`
 }
 
 func main() {
@@ -74,41 +69,25 @@ func run() error {
 	}
 	defer pool.Close()
 
-	publisher := rabbitmq.NewPublisher(cfg.RabbitMQURL, cfg.RabbitMQExchange, "order-service", log)
+	publisher := rabbitmq.NewPublisher(cfg.RabbitMQURL, cfg.RabbitMQExchange, serviceName, log)
 	defer publisher.Close()
-
-	relay := outbox.NewRelay(pool, publisher, outbox.RelayConfig{
-		BatchSize:       cfg.Outbox.BatchSize,
-		PollInterval:    cfg.Outbox.PollInterval,
-		MaxBackoff:      cfg.Outbox.MaxBackoff,
-		PublishTimeout:  cfg.Outbox.PublishTimeout,
-		BatchTimeout:    cfg.Outbox.BatchTimeout,
-		Retention:       cfg.Outbox.Retention,
-		CleanupInterval: cfg.Outbox.CleanupInterval,
-	}, log)
+	relay := outbox.NewRelay(pool, orderpostgres.OutboxTable, publisher, cfg.Outbox, log)
 
 	repo := orderpostgres.NewRepository(pool)
 	svc := application.NewService(repo, log)
-	handler := orderhttp.NewHandler(svc)
+	httpHandler := orderhttp.NewHandler(svc)
+	eventHandler := ordermessaging.NewHandler(svc)
+
+	consumer := rabbitmq.NewConsumer(cfg.RabbitMQURL, serviceName, rabbitmq.Topology{
+		Exchange:    cfg.RabbitMQExchange,
+		Queue:       cfg.RabbitMQQueue,
+		RoutingKeys: eventHandler.RoutingKeys(),
+	}, cfg.Consumer, log)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, httpx.Logger(log), httpx.Recoverer)
-
-	// liveness: the process is alive
-	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	// readiness: the service is ready to accept traffic (the database is available)
-	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if err := pool.Ping(ctx); err != nil {
-			httpx.WriteError(w, http.StatusServiceUnavailable, "not_ready", "database unavailable")
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	})
-	r.Route("/api/v1", handler.Register)
+	httpx.RegisterHealth(r, pool.Ping)
+	r.Route("/api/v1", httpHandler.Register)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -119,9 +98,10 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// The HTTP server and the outbox relay stop together: on a signal or when either fails.
+	// All components stop together: on a signal or when any of them fails.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return httpserver.Run(gctx, srv, cfg.ShutdownTimeout, log) })
 	g.Go(func() error { return relay.Run(gctx) })
+	g.Go(func() error { return consumer.Run(gctx, eventHandler.Handle) })
 	return g.Wait()
 }

@@ -1,6 +1,9 @@
 // Package outbox implements the transactional outbox pattern: events are stored in the
 // same database transaction as the business data and published to the broker by a
-// background relay. Delivery is at-least-once, so consumers must deduplicate by message ID.
+// background relay. Delivery is at-least-once, so consumers must be idempotent.
+//
+// Every service owns its outbox table (order_outbox, payment_outbox) with the schema
+// from the service's migrations; the table name is passed explicitly.
 package outbox
 
 import (
@@ -44,17 +47,18 @@ func NewMessage(aggregateType, aggregateID, eventType string, payload any) (Mess
 	}, nil
 }
 
-// Store inserts messages using the caller's transaction, so they are committed or
-// rolled back together with the business data.
-func Store(ctx context.Context, tx pgx.Tx, msgs ...Message) error {
+// Store inserts messages into the service's outbox table using the caller's transaction,
+// so they are committed or rolled back together with the business data.
+func Store(ctx context.Context, tx pgx.Tx, table string, msgs ...Message) error {
 	if len(msgs) == 0 {
 		return nil
 	}
+	query := fmt.Sprintf(`
+		INSERT INTO %s (id, aggregate_type, aggregate_id, event_type, payload, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6)`, pgx.Identifier{table}.Sanitize())
 	batch := &pgx.Batch{}
 	for _, msg := range msgs {
-		batch.Queue(`
-			INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
+		batch.Queue(query,
 			msg.ID, msg.AggregateType, msg.AggregateID, msg.EventType, msg.Payload, msg.CreatedAt)
 	}
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {

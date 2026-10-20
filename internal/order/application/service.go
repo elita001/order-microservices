@@ -28,6 +28,9 @@ type Repository interface {
 	Create(ctx context.Context, order *domain.Order, events ...domain.Event) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, error)
 	ListByCustomer(ctx context.Context, customerID uuid.UUID, limit, offset int) ([]domain.Order, error)
+	// UpdateStatus changes the status only if the order is currently in the from status
+	// and reports whether it was changed.
+	UpdateStatus(ctx context.Context, id uuid.UUID, from, to domain.Status, updatedAt time.Time) (bool, error)
 }
 
 // Logger is the logging capability required by the application service.
@@ -65,6 +68,12 @@ type ListOrdersResult struct {
 	Orders []domain.Order
 	Limit  int
 	Offset int
+}
+
+type CompletePaymentInput struct {
+	OrderID   uuid.UUID
+	Succeeded bool
+	Reason    string // why the payment failed; empty on success
 }
 
 func (s *Service) Create(ctx context.Context, in CreateOrderInput) (*domain.Order, error) {
@@ -126,6 +135,35 @@ func (s *Service) ListByCustomer(ctx context.Context, in ListOrdersInput) (*List
 		return nil, fmt.Errorf("list orders for customer %s: %w", in.CustomerID, err)
 	}
 	return &ListOrdersResult{Orders: orders, Limit: limit, Offset: in.Offset}, nil
+}
+
+// CompletePayment moves a pending order to paid or payment_failed.
+// Repeated or late events do not change the order, which makes the event handler idempotent.
+func (s *Service) CompletePayment(ctx context.Context, in CompletePaymentInput) error {
+	if in.OrderID == uuid.Nil {
+		return &domain.ValidationError{Field: "order_id", Message: "is required"}
+	}
+	to := domain.StatusPaymentFailed
+	if in.Succeeded {
+		to = domain.StatusPaid
+	}
+
+	updated, err := s.repo.UpdateStatus(ctx, in.OrderID, domain.StatusPending, to, s.now())
+	if err != nil {
+		return fmt.Errorf("complete payment for order %s: %w", in.OrderID, err)
+	}
+	if !updated {
+		s.logger.Info("order status not changed: order is not pending or does not exist",
+			"order_id", in.OrderID, "target_status", to)
+		return nil
+	}
+
+	s.logger.Info("order status changed",
+		"order_id", in.OrderID,
+		"status", to,
+		"reason", in.Reason,
+	)
+	return nil
 }
 
 func validate(in CreateOrderInput) error {
