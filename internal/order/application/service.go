@@ -28,9 +28,9 @@ type Repository interface {
 	Create(ctx context.Context, order *domain.Order, events ...domain.Event) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, error)
 	ListByCustomer(ctx context.Context, customerID uuid.UUID, limit, offset int) ([]domain.Order, error)
-	// UpdateStatus changes the status only if the order is currently in the from status
-	// and reports whether it was changed.
-	UpdateStatus(ctx context.Context, id uuid.UUID, from, to domain.Status, updatedAt time.Time) (bool, error)
+	// UpdateStatus changes the status only if the order is currently in one of the from
+	// statuses and reports whether it was changed.
+	UpdateStatus(ctx context.Context, id uuid.UUID, from []domain.Status, to domain.Status, updatedAt time.Time) (bool, error)
 }
 
 // Logger is the logging capability required by the application service.
@@ -147,21 +147,36 @@ func (s *Service) CompletePayment(ctx context.Context, in CompletePaymentInput) 
 	if in.Succeeded {
 		to = domain.StatusPaid
 	}
+	return s.changeStatus(ctx, in.OrderID, []domain.Status{domain.StatusPending}, to, in.Reason)
+}
 
-	updated, err := s.repo.UpdateStatus(ctx, in.OrderID, domain.StatusPending, to, s.now())
+// MarkShipped moves a paid order to shipped.
+//
+// Events from different services may arrive out of order: the delivery event can be
+// handled before the payment event. A shipment implies a successful payment, so a pending
+// order is moved to shipped as well, and the late payment event then changes nothing.
+func (s *Service) MarkShipped(ctx context.Context, orderID uuid.UUID) error {
+	if orderID == uuid.Nil {
+		return &domain.ValidationError{Field: "order_id", Message: "is required"}
+	}
+	return s.changeStatus(ctx, orderID, []domain.Status{domain.StatusPending, domain.StatusPaid}, domain.StatusShipped, "")
+}
+
+func (s *Service) changeStatus(ctx context.Context, orderID uuid.UUID, from []domain.Status, to domain.Status, reason string) error {
+	updated, err := s.repo.UpdateStatus(ctx, orderID, from, to, s.now())
 	if err != nil {
-		return fmt.Errorf("complete payment for order %s: %w", in.OrderID, err)
+		return fmt.Errorf("change status of order %s to %s: %w", orderID, to, err)
 	}
 	if !updated {
-		s.logger.Info("order status not changed: order is not pending or does not exist",
-			"order_id", in.OrderID, "target_status", to)
+		s.logger.Info("order status not changed: order is in another status or does not exist",
+			"order_id", orderID, "target_status", to)
 		return nil
 	}
 
 	s.logger.Info("order status changed",
-		"order_id", in.OrderID,
+		"order_id", orderID,
 		"status", to,
-		"reason", in.Reason,
+		"reason", reason,
 	)
 	return nil
 }

@@ -15,6 +15,7 @@ const (
 	StatusPending       Status = "pending"
 	StatusPaid          Status = "paid"
 	StatusPaymentFailed Status = "payment_failed"
+	StatusShipped       Status = "shipped"
 )
 
 // Item is an order line. Price is the per-unit price in minor currency units.

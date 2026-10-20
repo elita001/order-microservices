@@ -6,23 +6,34 @@ A microservices system for placing and processing orders, written in Go.
 
 | Service              | Status    | Description                    |
 |----------------------|-----------|--------------------------------|
-| Order Service        | ✅ Step 3 | create, retrieve, and list orders; updates order status from payment results |
+| Order Service        | ✅ Step 4 | create, retrieve, and list orders; tracks order status from payment and delivery events |
 | Payment Service      | ✅ Step 3 | charges orders through a payment provider stub, publishes the result |
-| Notification Service | ⏳        | notifications                  |
+| Delivery Service     | ✅ Step 4 | hands paid orders over to a carrier stub, publishes the tracking number |
+| Notification Service | ✅ Step 4 | emails customers about every order step (Mailpit in development) |
 | API Gateway          | ⏳        | entry point                    |
 
 ## How it works
 
 ```
-client ──POST /orders──▶ Order Service ──order.created──▶ RabbitMQ ──▶ Payment Service ──▶ provider stub
-                              ▲                                              │
-                              └──── payment.succeeded / payment.failed ◀─────┘
+client ──POST /orders──▶ Order Service ─── order.created ───▶ Payment Service ──▶ payment provider stub
+                              ▲   ▲                                │
+                              │   └──── payment.succeeded/failed ◀─┤
+                              │                                    ▼
+                              └──────── delivery.created ◀──── Delivery Service ──▶ carrier stub
+
+             all events ──▶ Notification Service ──SMTP──▶ Mailpit (customer emails)
 ```
 
 1. Order Service saves the order (`pending`) and the `order.created` event in one transaction.
 2. Payment Service consumes `order.created`, charges the customer through the provider
    stub, and saves the payment and `payment.succeeded` or `payment.failed` in one transaction.
-3. Order Service consumes the result and moves the order to `paid` or `payment_failed`.
+3. Order Service moves the order to `paid` or `payment_failed`.
+4. Delivery Service consumes `payment.succeeded`, registers a parcel with the carrier stub,
+   and publishes `delivery.created` with the tracking number; the order becomes `shipped`.
+5. Notification Service emails the customer on each step: order received, payment received
+   or failed, order shipped.
+
+Order statuses: `pending` → `paid` → `shipped`, or `pending` → `payment_failed`.
 
 Services share one PostgreSQL database, but each owns its tables and migrations and never
 reads another service's tables: they communicate only through APIs and events.
@@ -46,13 +57,14 @@ Vault, CI/CD variables).
 Management UIs:
 
 - RabbitMQ: http://localhost:15672 (credentials `RABBITMQ_USER` / `RABBITMQ_PASSWORD` from `.env`, `app` / `app` by default)
+- Mailpit (all emails sent by the system): http://localhost:8025
 
 Useful commands:
 
 | Command         | Description                                          |
 |-----------------|------------------------------------------------------|
 | `make logs`     | follow the logs of all application services          |
-| `make payments` | latest orders with their payment status              |
+| `make orders`   | latest orders with their payment, shipment, and sent emails |
 | `make outbox`   | latest outbox messages of all services and their delivery state |
 | `make test`     | unit tests with the race detector                    |
 
@@ -68,8 +80,9 @@ curl -s -X POST 'localhost:8081/api/v1/orders' \
   }'
 ```
 
-The order is created as `pending`. About a second later it becomes `paid` or
-`payment_failed` (by default the stub declines ~20% of payments):
+The order is created as `pending`. A second or two later it becomes `shipped` or
+`payment_failed` (by default the payment stub declines ~20% of payments), and the
+emails appear in Mailpit:
 
 ```bash
 curl -s 'localhost:8081/api/v1/orders/<id>'
@@ -87,13 +100,14 @@ Amounts are stored in the currency's smallest units (kopecks): `59900` = RUB 599
 
 | Event               | Producer | Consumers | Payload contract                                 |
 |---------------------|----------|-----------|--------------------------------------------------|
-| `order.created`     | order    | payment   | [`pkg/events/order.go`](pkg/events/order.go)     |
-| `payment.succeeded` | payment  | order     | [`pkg/events/payment.go`](pkg/events/payment.go) |
-| `payment.failed`    | payment  | order     | [`pkg/events/payment.go`](pkg/events/payment.go) |
+| `order.created`     | order    | payment, notification | [`pkg/events/order.go`](pkg/events/order.go) |
+| `payment.succeeded` | payment  | order, delivery, notification | [`pkg/events/payment.go`](pkg/events/payment.go) |
+| `payment.failed`    | payment  | order, notification | [`pkg/events/payment.go`](pkg/events/payment.go) |
+| `delivery.created`  | delivery | order, notification | [`pkg/events/delivery.go`](pkg/events/delivery.go) |
 
 All events go through the `orderflow.events` topic exchange; the event type is the
 routing key. Each consuming service has its own durable quorum queue (`order-service`,
-`payment-service`) and declares the exchange, queue, and bindings on connect, so the
+`payment-service`, `delivery-service`, `notification-service`) and declares the exchange, queue, and bindings on connect, so the
 services can start in any order and messages wait in the queue while a consumer is down.
 
 ### Transactional outbox
@@ -101,7 +115,7 @@ services can start in any order and messages wait in the queue while a consumer 
 Services never publish to RabbitMQ from business code. Instead:
 
 1. The business data and the event row in the service's outbox table (`order_outbox`,
-   `payment_outbox`) are written in **one database transaction**, so the event exists
+   `payment_outbox`, `delivery_outbox`) are written in **one database transaction**, so the event exists
    if and only if the data change exists.
 2. A background **outbox relay** (runs inside each service) locks a batch of unpublished
    rows with `FOR UPDATE SKIP LOCKED`, publishes them, waits for **publisher confirms**,
@@ -119,19 +133,34 @@ after the broker confirm but before `published_at` is saved), so every handler i
   is created *before* calling the provider, and its ID is the provider's idempotency key:
   if processing is interrupted and the message is redelivered, the provider returns the
   same result instead of charging twice. A completed payment is never charged again.
-- **Order Service** changes the status only from `pending`
-  (`UPDATE ... WHERE status = 'pending'`), so repeated or late events change nothing.
+- **Delivery Service** works the same way: one shipment per order, and the shipment ID is
+  the carrier's idempotency key.
+- **Order Service** changes the status only from the expected statuses
+  (`UPDATE ... WHERE status = ANY(...)`), so repeated or late events change nothing.
+  Events from different services can arrive out of order (e.g., `delivery.created` before
+  `payment.succeeded`); a shipment implies payment, so `pending` → `shipped` is allowed
+  and the late payment event is ignored.
+- **Notification Service** sends at most one email of each kind per order
+  (`UNIQUE (kind, order_id)`). The row is inserted and the email is sent in one
+  transaction: a concurrent duplicate waits on the unique index, and a failed send rolls
+  the row back so that a retry sends again. A crash right after sending can still cause
+  a rare duplicate email: SMTP offers no stronger guarantee.
 
 Consumer error handling: a malformed message is rejected (it cannot succeed on retry); any
 other error (e.g., the database is down) requeues the message after `CONSUMER_REQUEUE_DELAY`.
 Quorum queues drop a message after 20 redeliveries, so a poison message cannot loop forever.
 
-### Payment provider stub
+### External service stubs
 
-The stub responds after a random delay between `PAYMENT_STUB_MIN_DELAY` and
-`PAYMENT_STUB_MAX_DELAY` and declines a `PAYMENT_STUB_FAILURE_RATE` share of payments
-(`insufficient_funds`, `card_declined`, `card_expired`). Like a real provider, it is
-idempotent: the outcome is derived from the idempotency key.
+| Stub | Behavior |
+|------|----------|
+| Payment provider | random delay; declines a `PAYMENT_STUB_FAILURE_RATE` share of payments (`insufficient_funds`, `card_declined`, `card_expired`) — a business outcome, published as `payment.failed` |
+| Carrier | random delay; fails a `DELIVERY_STUB_ERROR_RATE` share of calls with a technical error — the consumer retries until it succeeds |
+| Customer directory | returns `customer-<first 8 chars of customer ID>@example.com` |
+| Email | real SMTP to [Mailpit](https://mailpit.axllent.org), which catches every email |
+
+Like real providers, the payment and carrier stubs are idempotent: the outcome (decline,
+tracking number) is derived from the idempotency key, so a retry gets the same result.
 
 ## Configuration
 
@@ -139,7 +168,7 @@ Common variables (both services):
 
 | Variable                    | Default            | Description                              |
 |-----------------------------|--------------------|------------------------------------------|
-| `HTTP_ADDR`                 | `:8081` / `:8082`  | listen address (order / payment)         |
+| `HTTP_ADDR`                 | `:8081`–`:8084`    | listen address (order, payment, delivery, notification) |
 | `POSTGRES_DSN`              | — (required)       | PostgreSQL connection string             |
 | `RABBITMQ_URL`              | — (required)       | AMQP connection string                   |
 | `RABBITMQ_EXCHANGE`         | `orderflow.events` | topic exchange for integration events    |
@@ -159,13 +188,23 @@ Common variables (both services):
 | `CONSUMER_REQUEUE_DELAY`    | `1s`               | pause before requeueing a failed message |
 | `CONSUMER_MAX_BACKOFF`      | `30s`              | maximum pause between reconnects         |
 
-Payment Service only:
+The notification service has no outbox, so the `OUTBOX_*` variables do not apply to it.
 
-| Variable                    | Default | Description                         |
-|-----------------------------|---------|-------------------------------------|
-| `PAYMENT_STUB_FAILURE_RATE` | `0.2`   | share of declined payments, 0..1    |
-| `PAYMENT_STUB_MIN_DELAY`    | `100ms` | minimum provider response time      |
-| `PAYMENT_STUB_MAX_DELAY`    | `1s`    | maximum provider response time      |
+Service-specific variables:
+
+| Service      | Variable                    | Default | Description                              |
+|--------------|-----------------------------|---------|------------------------------------------|
+| payment      | `PAYMENT_STUB_FAILURE_RATE` | `0.2`   | share of declined payments, 0..1         |
+| payment      | `PAYMENT_STUB_MIN_DELAY`    | `100ms` | minimum provider response time           |
+| payment      | `PAYMENT_STUB_MAX_DELAY`    | `1s`    | maximum provider response time           |
+| delivery     | `DELIVERY_STUB_ERROR_RATE`  | `0.1`   | share of carrier calls failing with a technical error |
+| delivery     | `DELIVERY_STUB_MIN_DELAY`   | `100ms` | minimum carrier response time            |
+| delivery     | `DELIVERY_STUB_MAX_DELAY`   | `500ms` | maximum carrier response time            |
+| notification | `SMTP_HOST`, `SMTP_PORT`    | `localhost`, `1025` | SMTP server                  |
+| notification | `SMTP_USERNAME`, `SMTP_PASSWORD` | — | credentials; empty disables authentication |
+| notification | `SMTP_TLS`                  | `false` | require STARTTLS                         |
+| notification | `SMTP_FROM`                 | `OrderFlow <noreply@orderflow.local>` | sender |
+| notification | `SMTP_TIMEOUT`              | `10s`   | timeout of one SMTP session              |
 
 ## Project structure
 
@@ -176,7 +215,9 @@ internal/<service>/application/          use cases and ports
 internal/<service>/adapter/http/         HTTP delivery adapter
 internal/<service>/adapter/messaging/    RabbitMQ delivery adapter (event handlers)
 internal/<service>/adapter/postgres/     PostgreSQL persistence adapter
-internal/payment/adapter/provider/       payment provider adapters (stub)
+internal/<service>/adapter/provider/     external provider adapters: payment provider, carrier (stubs)
+internal/notification/adapter/smtp/      email delivery over SMTP
+internal/notification/adapter/customer/  customer directory (stub)
 pkg/                                     shared infrastructure: logger, HTTP helpers, shutdown
 pkg/outbox/                              transactional outbox: storing messages and the relay
 pkg/rabbitmq/                            RabbitMQ connection, publisher with confirms, consumer

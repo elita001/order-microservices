@@ -3,6 +3,7 @@ package application
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -36,11 +37,12 @@ func (f *fakeRepo) ListByCustomer(_ context.Context, _ uuid.UUID, limit, offset 
 	return []domain.Order{}, f.err
 }
 
-func (f *fakeRepo) UpdateStatus(_ context.Context, id uuid.UUID, from, to domain.Status, _ time.Time) (bool, error) {
+func (f *fakeRepo) UpdateStatus(_ context.Context, id uuid.UUID, from []domain.Status, to domain.Status, _ time.Time) (bool, error) {
 	if f.err != nil {
 		return false, f.err
 	}
-	if current, ok := f.statuses[id]; !ok || current != from {
+	current, ok := f.statuses[id]
+	if !ok || !slices.Contains(from, current) {
 		return false, nil
 	}
 	f.statuses[id] = to
@@ -198,5 +200,46 @@ func TestService_CompletePayment_RepoErrorIsReturned(t *testing.T) {
 		CompletePaymentInput{OrderID: uuid.New(), Succeeded: true})
 	if !errors.Is(err, dbErr) {
 		t.Fatalf("expected wrapped db error, got %v", err)
+	}
+}
+
+func TestService_MarkShipped(t *testing.T) {
+	tests := []struct {
+		name       string
+		current    domain.Status
+		wantStatus domain.Status
+	}{
+		{"paid order is shipped", domain.StatusPaid, domain.StatusShipped},
+		{"delivery event before payment event", domain.StatusPending, domain.StatusShipped},
+		{"duplicate event is ignored", domain.StatusShipped, domain.StatusShipped},
+		{"failed payment is not shipped", domain.StatusPaymentFailed, domain.StatusPaymentFailed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := uuid.New()
+			repo := &fakeRepo{statuses: map[uuid.UUID]domain.Status{id: tt.current}}
+			if err := newTestService(repo).MarkShipped(context.Background(), id); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := repo.statuses[id]; got != tt.wantStatus {
+				t.Errorf("status = %q, want %q", got, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestService_LatePaymentEventDoesNotOverrideShipped(t *testing.T) {
+	id := uuid.New()
+	repo := &fakeRepo{statuses: map[uuid.UUID]domain.Status{id: domain.StatusPending}}
+	svc := newTestService(repo)
+
+	if err := svc.MarkShipped(context.Background(), id); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if err := svc.CompletePayment(context.Background(), CompletePaymentInput{OrderID: id, Succeeded: true}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := repo.statuses[id]; got != domain.StatusShipped {
+		t.Errorf("status = %q, want %q", got, domain.StatusShipped)
 	}
 }

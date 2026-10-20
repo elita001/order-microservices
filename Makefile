@@ -1,4 +1,4 @@
-.PHONY: up down logs ps test tidy migrate-new outbox payments
+.PHONY: up down logs ps test tidy migrate-new outbox orders
 
 up: .env      ## build and start everything
 	docker compose up -d --build --remove-orphans
@@ -11,7 +11,7 @@ down:          ## stop everything (add -v to remove database data)
 	docker compose down
 
 logs:          ## follow application logs
-	docker compose logs -f order payment
+	docker compose logs -f order payment delivery notification
 
 ps:
 	docker compose ps
@@ -19,13 +19,18 @@ ps:
 outbox:        ## show the latest outbox messages of all services
 	docker compose exec postgres sh -c 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c \
 		"SELECT event_type, aggregate_id, attempts, published_at, last_error FROM ( \
-			SELECT * FROM order_outbox UNION ALL SELECT * FROM payment_outbox \
+			SELECT * FROM order_outbox UNION ALL SELECT * FROM payment_outbox UNION ALL SELECT * FROM delivery_outbox \
 		) o ORDER BY created_at DESC LIMIT 20"'
 
-payments:      ## show orders and their payments
+orders:        ## show the latest orders with their payment, shipment, and notifications
 	docker compose exec postgres sh -c 'psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -c \
-		"SELECT o.id AS order_id, o.status AS order_status, o.total_amount, p.status AS payment_status, p.failure_reason \
-		FROM orders o LEFT JOIN payments p ON p.order_id = o.id ORDER BY o.created_at DESC LIMIT 20"'
+		"SELECT o.id AS order_id, o.status, o.total_amount AS amount, p.status AS payment, p.failure_reason, \
+			s.carrier, s.tracking_number, \
+			(SELECT array_agg(n.kind ORDER BY n.sent_at) FROM notifications n WHERE n.order_id = o.id) AS emails \
+		FROM orders o \
+		LEFT JOIN payments p ON p.order_id = o.id \
+		LEFT JOIN shipments s ON s.order_id = o.id \
+		ORDER BY o.created_at DESC LIMIT 20"'
 
 test:
 	go test -race -count=1 ./...

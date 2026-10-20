@@ -113,14 +113,18 @@ func (r *Repository) ListByCustomer(ctx context.Context, customerID uuid.UUID, l
 	return orders, rows.Err()
 }
 
-// UpdateStatus changes the status only if the order is currently in the from status.
+// UpdateStatus changes the status only if the order is currently in one of the from statuses.
 // The check and the update are one statement, so concurrent or repeated updates are safe.
 // It returns false if the order does not exist or is in a different status.
-func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, from, to domain.Status, updatedAt time.Time) (bool, error) {
+func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, from []domain.Status, to domain.Status, updatedAt time.Time) (bool, error) {
+	fromStrings := make([]string, 0, len(from))
+	for _, status := range from {
+		fromStrings = append(fromStrings, string(status))
+	}
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE orders SET status = $3, updated_at = $4
-		WHERE id = $1 AND status = $2`,
-		id, string(from), string(to), updatedAt)
+		WHERE id = $1 AND status = ANY($2)`,
+		id, fromStrings, string(to), updatedAt)
 	if err != nil {
 		return false, fmt.Errorf("update order status: %w", err)
 	}
