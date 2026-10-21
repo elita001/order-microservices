@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/sync/errgroup"
 
+	ordercache "github.com/elita001/order-microservices/internal/order/adapter/cache"
 	orderhttp "github.com/elita001/order-microservices/internal/order/adapter/http"
 	ordermessaging "github.com/elita001/order-microservices/internal/order/adapter/messaging"
 	orderpostgres "github.com/elita001/order-microservices/internal/order/adapter/postgres"
@@ -25,6 +26,7 @@ import (
 	"github.com/elita001/order-microservices/pkg/outbox"
 	"github.com/elita001/order-microservices/pkg/postgres"
 	"github.com/elita001/order-microservices/pkg/rabbitmq"
+	"github.com/elita001/order-microservices/pkg/redisclient"
 )
 
 const serviceName = "order-service"
@@ -41,6 +43,8 @@ type config struct {
 
 	Outbox   outbox.RelayConfig      `envPrefix:"OUTBOX_"`
 	Consumer rabbitmq.ConsumerConfig `envPrefix:"CONSUMER_"`
+	Redis    redisclient.Config      `envPrefix:"REDIS_"`
+	Cache    ordercache.Config       `envPrefix:"CACHE_"`
 }
 
 func main() {
@@ -73,7 +77,18 @@ func run() error {
 	defer publisher.Close()
 	relay := outbox.NewRelay(pool, orderpostgres.OutboxTable, publisher, cfg.Outbox, log)
 
-	repo := orderpostgres.NewRepository(pool)
+	rdb, err := redisclient.New(cfg.Redis)
+	if err != nil {
+		return fmt.Errorf("create redis client: %w", err)
+	}
+	defer rdb.Close()
+	// The cache is optional: without Redis, orders are read from the database.
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Warn("redis is unavailable, the order cache is bypassed until it recovers", "error", err)
+	}
+
+	// Cache-aside decorator: the application service does not know about the cache.
+	repo := ordercache.New(orderpostgres.NewRepository(pool), rdb, cfg.Cache, cfg.Redis.OperationTimeout, log)
 	svc := application.NewService(repo, log)
 	httpHandler := orderhttp.NewHandler(svc)
 	eventHandler := ordermessaging.NewHandler(svc)

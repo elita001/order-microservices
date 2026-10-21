@@ -7,7 +7,7 @@ A microservices system for placing and processing orders, written in Go.
 | Service              | Status    | Description                    |
 |----------------------|-----------|--------------------------------|
 | API Gateway          | ✅ Step 5 | the single entry point: request IDs, rate limiting, idempotency, timeouts |
-| Order Service        | ✅ Step 5 | create, retrieve, and list orders; tracks order status from payment and delivery events |
+| Order Service        | ✅ Step 6 | create, retrieve, and list orders; tracks order status from payment and delivery events; caches orders in Redis |
 | Payment Service      | ✅ Step 3 | charges orders through a payment provider stub, publishes the result |
 | Delivery Service     | ✅ Step 4 | hands paid orders over to a carrier stub, publishes the tracking number |
 | Notification Service | ✅ Step 4 | emails customers about every order step (Mailpit in development) |
@@ -136,6 +136,28 @@ constraint and replays the existing order. The two layers complement each other:
 answers repeats fast and keeps them away from the services, and the database guarantees
 correctness when Redis is down or its entry has expired.
 
+## Order cache
+
+`GET /orders/{id}` uses **cache-aside** in Order Service, the owner of the data:
+read Redis → on a miss read PostgreSQL and put the order into Redis. The cache is a
+decorator around the repository ([`internal/order/adapter/cache`](internal/order/adapter/cache)),
+so the use cases do not know about it.
+
+- **Invalidation.** Every status change (`paid`, `payment_failed`, `shipped`) invalidates
+  the entry right after the database update; `CACHE_TTL` (with 10% jitter, so entries do
+  not expire all at once) only bounds staleness if an invalidation is lost.
+- **No stale writes.** The classic cache-aside race: a reader loads the order, the status
+  changes and the entry is invalidated, then the reader writes the old order back. Each
+  entry stores its version (`updated_at`), and a Lua script writes only newer versions;
+  invalidation leaves a tombstone with the new version instead of deleting the key, so the
+  late write of the old version is rejected.
+- **No stampede.** Concurrent misses for the same order share one database query
+  (`singleflight`).
+- **Fail-open.** Redis errors are logged and the database is used; every Redis call is
+  bounded by `REDIS_OPERATION_TIMEOUT`.
+- Lists (`GET /orders?customer_id=`) are not cached: they change with every new order, and
+  invalidating them correctly costs more than the query, which uses an index.
+
 ## Events
 
 | Event               | Producer | Consumers | Payload contract                                 |
@@ -221,6 +243,14 @@ API gateway:
 | `IDEMPOTENCY_LOCK_TTL`      | `30s`    | lock of a request in progress (crash safety)   |
 | `LOG_LEVEL`, `SHUTDOWN_TIMEOUT` | `info`, `10s` | as in the services                     |
 
+Order Service cache:
+
+| Variable                  | Default | Description                                          |
+|---------------------------|---------|------------------------------------------------------|
+| `REDIS_URL`               | — (required) | `redis://:password@host:6379/0`                 |
+| `REDIS_OPERATION_TIMEOUT` | `300ms` | one Redis call; on timeout the database is used      |
+| `CACHE_TTL`               | `5m`    | lifetime of a cached order (+ up to 10% jitter)      |
+
 Common variables of the services:
 
 | Variable                    | Default            | Description                              |
@@ -281,6 +311,7 @@ pkg/outbox/                              transactional outbox: storing messages 
 pkg/rabbitmq/                            RabbitMQ connection, publisher with confirms, consumer
 pkg/events/                              integration event contracts shared between services
 pkg/redisclient/                         Redis client with fail-fast timeouts
+internal/order/adapter/cache/            cache-aside decorator of the order repository
 migrations/<service>/                    SQL migrations per service (golang-migrate)
 ```
 
