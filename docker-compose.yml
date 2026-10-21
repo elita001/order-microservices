@@ -52,6 +52,24 @@ services:
       timeout: 5s
       retries: 10
 
+  # Rate limits and idempotency keys only: every key has a TTL, nothing needs to survive
+  # a restart (the order service enforces idempotency in the database as well).
+  redis:
+    image: redis:7.4-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?copy .env.example to .env}
+    command:
+      - sh
+      - -c
+      - redis-server --requirepass "$${REDIS_PASSWORD}" --save "" --appendonly no --maxmemory 128mb --maxmemory-policy volatile-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # Fake SMTP server: catches all emails and shows them in a web UI.
   mailpit:
     image: axllent/mailpit:v1.27
@@ -98,8 +116,38 @@ services:
       - "-database=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable&x-migrations-table=notification_schema_migrations"
       - "up"
 
+  # The only entry point for external clients.
+  gateway:
+    <<: *service
+    build:
+      context: .
+      args:
+        SERVICE: gateway
+    environment:
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ORDER_SERVICE_URL: "http://order:8081"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      RATE_LIMIT_READ_RPS: ${RATE_LIMIT_READ_RPS:-50}
+      RATE_LIMIT_READ_BURST: ${RATE_LIMIT_READ_BURST:-100}
+      RATE_LIMIT_WRITE_RPS: ${RATE_LIMIT_WRITE_RPS:-5}
+      RATE_LIMIT_WRITE_BURST: ${RATE_LIMIT_WRITE_BURST:-10}
+    ports:
+      - "${GATEWAY_HTTP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # Redis and the order service are not required to start: the gateway fails open
+    # without Redis and returns 502 while the order service is down.
+    depends_on:
+      redis:
+        condition: service_started
+
   # The services do not strictly need RabbitMQ at startup: the outbox and the consumers
   # reconnect on their own. Waiting for it only keeps startup logs clean.
+  # Their ports are published for debugging only; clients go through the gateway.
   order:
     <<: *service
     build:

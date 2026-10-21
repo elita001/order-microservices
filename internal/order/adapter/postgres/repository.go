@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/elita001/order-microservices/internal/order/domain"
@@ -17,6 +18,11 @@ import (
 
 // OutboxTable is the order service's outbox table.
 const OutboxTable = "order_outbox"
+
+const (
+	idempotencyKeyConstraint = "orders_idempotency_key_key"
+	uniqueViolation          = "23505"
+)
 
 type Repository struct {
 	pool *pgxpool.Pool
@@ -35,9 +41,15 @@ func (r *Repository) Create(ctx context.Context, order *domain.Order, domainEven
 
 	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO orders (id, customer_id, status, total_amount, currency, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			order.ID, order.CustomerID, string(order.Status), order.TotalAmount, order.Currency, order.CreatedAt, order.UpdatedAt)
+			INSERT INTO orders (id, customer_id, status, total_amount, currency, created_at, updated_at,
+			                    idempotency_key, request_hash)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, NULLIF($8, ''), $9)`,
+			order.ID, order.CustomerID, string(order.Status), order.TotalAmount, order.Currency, order.CreatedAt, order.UpdatedAt,
+			order.IdempotencyKey, order.RequestHash)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == uniqueViolation && pgErr.ConstraintName == idempotencyKeyConstraint {
+			return domain.ErrDuplicateIdempotencyKey
+		}
 		if err != nil {
 			return fmt.Errorf("insert order: %w", err)
 		}
@@ -62,9 +74,11 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, 
 		status string
 	)
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, customer_id, status, total_amount, currency, created_at, updated_at
+		SELECT id, customer_id, status, total_amount, currency, created_at, updated_at,
+		       COALESCE(idempotency_key, ''), COALESCE(request_hash, '')
 		FROM orders WHERE id = $1`, id).
-		Scan(&order.ID, &order.CustomerID, &status, &order.TotalAmount, &order.Currency, &order.CreatedAt, &order.UpdatedAt)
+		Scan(&order.ID, &order.CustomerID, &status, &order.TotalAmount, &order.Currency, &order.CreatedAt, &order.UpdatedAt,
+			&order.IdempotencyKey, &order.RequestHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}
@@ -88,6 +102,18 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, 
 		return nil, fmt.Errorf("scan order items: %w", err)
 	}
 	return &order, nil
+}
+
+func (r *Repository) GetByIdempotencyKey(ctx context.Context, key string) (*domain.Order, error) {
+	var id uuid.UUID
+	err := r.pool.QueryRow(ctx, `SELECT id FROM orders WHERE idempotency_key = $1`, key).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select order by idempotency key: %w", err)
+	}
+	return r.GetByID(ctx, id)
 }
 
 func (r *Repository) ListByCustomer(ctx context.Context, customerID uuid.UUID, limit, offset int) ([]domain.Order, error) {

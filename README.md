@@ -6,16 +6,17 @@ A microservices system for placing and processing orders, written in Go.
 
 | Service              | Status    | Description                    |
 |----------------------|-----------|--------------------------------|
-| Order Service        | ✅ Step 4 | create, retrieve, and list orders; tracks order status from payment and delivery events |
+| API Gateway          | ✅ Step 5 | the single entry point: request IDs, rate limiting, idempotency, timeouts |
+| Order Service        | ✅ Step 5 | create, retrieve, and list orders; tracks order status from payment and delivery events |
 | Payment Service      | ✅ Step 3 | charges orders through a payment provider stub, publishes the result |
 | Delivery Service     | ✅ Step 4 | hands paid orders over to a carrier stub, publishes the tracking number |
 | Notification Service | ✅ Step 4 | emails customers about every order step (Mailpit in development) |
-| API Gateway          | ⏳        | entry point                    |
 
 ## How it works
 
 ```
-client ──POST /orders──▶ Order Service ─── order.created ───▶ Payment Service ──▶ payment provider stub
+client ──▶ API Gateway ──▶ Order Service ─── order.created ───▶ Payment Service ──▶ payment provider stub
+             │ Redis
                               ▲   ▲                                │
                               │   └──── payment.succeeded/failed ◀─┤
                               │                                    ▼
@@ -24,7 +25,9 @@ client ──POST /orders──▶ Order Service ─── order.created ──�
              all events ──▶ Notification Service ──SMTP──▶ Mailpit (customer emails)
 ```
 
-1. Order Service saves the order (`pending`) and the `order.created` event in one transaction.
+1. The API gateway checks the rate limit and the `Idempotency-Key` in Redis and forwards
+   the request; Order Service saves the order (`pending`) and the `order.created` event
+   in one transaction.
 2. Payment Service consumes `order.created`, charges the customer through the provider
    stub, and saves the payment and `payment.succeeded` or `payment.failed` in one transaction.
 3. Order Service moves the order to `paid` or `payment_failed`.
@@ -54,6 +57,9 @@ environment variables and contain no secrets or credentials. `.env` is for local
 development only; in production, values come from the platform (Kubernetes Secrets,
 Vault, CI/CD variables).
 
+Clients use the API gateway at http://localhost:8080. The services' own ports
+(8081–8084) are published for debugging only.
+
 Management UIs:
 
 - RabbitMQ: http://localhost:15672 (credentials `RABBITMQ_USER` / `RABBITMQ_PASSWORD` from `.env`, `app` / `app` by default)
@@ -71,8 +77,9 @@ Useful commands:
 ## Example requests
 
 ```bash
-curl -s -X POST 'localhost:8081/api/v1/orders' \
+curl -s -X POST 'localhost:8080/api/v1/orders' \
   -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: $(uuidgen)" \
   -d '{
     "customer_id": "7b0c8a3e-2f1d-4e5a-9b6c-1d2e3f4a5b6c",
     "currency": "RUB",
@@ -85,16 +92,49 @@ The order is created as `pending`. A second or two later it becomes `shipped` or
 emails appear in Mailpit:
 
 ```bash
-curl -s 'localhost:8081/api/v1/orders/<id>'
+curl -s 'localhost:8080/api/v1/orders/<id>'
 ```
 
 List a customer's orders:
 
 ```bash
-curl -s 'localhost:8081/api/v1/orders?customer_id=<customer-id>&limit=20&offset=0'
+curl -s 'localhost:8080/api/v1/orders?customer_id=<customer-id>&limit=20&offset=0'
 ```
 
 Amounts are stored in the currency's smallest units (kopecks): `59900` = RUB 599.00.
+
+## API Gateway
+
+The gateway is the single entry point for clients. It contains no business logic and
+applies the edge concerns to every request:
+
+- **Request ID.** The client's `X-Request-Id` is kept if it is short and safe to log,
+  otherwise a new one is generated. It is returned in the response and forwarded to the
+  services, so the logs of the gateway and of Order Service share one `request_id`.
+- **Rate limiting** per client IP in Redis (GCRA, exact across gateway replicas):
+  `RATE_LIMIT_WRITE_*` for `POST`, `RATE_LIMIT_READ_*` for `GET`. Over the limit the
+  client gets `429` with `Retry-After`.
+- **Idempotency.** A client can safely retry `POST /orders` (e.g., after a timeout) with
+  the same `Idempotency-Key` header, and only one order is created:
+
+  | Situation | Response |
+  |---|---|
+  | First request | goes to Order Service; the response is stored in Redis for `IDEMPOTENCY_TTL` |
+  | Repeat after it | the stored response with `Idempotent-Replayed: true` |
+  | Repeat while the first is in progress | `409` with `Retry-After: 1` |
+  | Same key, different body | `422 idempotency_key_reused` |
+  | First request failed with 5xx | not stored, the client can retry |
+
+- **Timeouts.** An upstream that cannot be reached gets `502`, one that does not respond
+  within `UPSTREAM_TIMEOUT` gets `504`; the client never waits indefinitely.
+
+**Redis is an accelerator, not a source of truth.** Every Redis call is bounded by
+`REDIS_OPERATION_TIMEOUT` (a hanging Redis is worse than a failed one), and on errors the
+gateway fails open: requests pass without rate limiting, and idempotency is enforced by
+Order Service itself, which stores the key in `orders.idempotency_key` with a unique
+constraint and replays the existing order. The two layers complement each other: Redis
+answers repeats fast and keeps them away from the services, and the database guarantees
+correctness when Redis is down or its entry has expired.
 
 ## Events
 
@@ -164,7 +204,24 @@ tracking number) is derived from the idempotency key, so a retry gets the same r
 
 ## Configuration
 
-Common variables (both services):
+API gateway:
+
+| Variable                    | Default  | Description                                    |
+|-----------------------------|----------|------------------------------------------------|
+| `HTTP_ADDR`                 | `:8080`  | listen address                                 |
+| `ORDER_SERVICE_URL`         | — (required) | Order Service base URL                     |
+| `REDIS_URL`                 | — (required) | `redis://:password@host:6379/0`            |
+| `REDIS_OPERATION_TIMEOUT`   | `300ms`  | one Redis call including dialing and retries   |
+| `REDIS_DIAL_TIMEOUT`, `REDIS_READ_TIMEOUT`, `REDIS_WRITE_TIMEOUT` | `500ms`, `200ms`, `200ms` | Redis client timeouts |
+| `UPSTREAM_TIMEOUT`          | `5s`     | whole upstream request                         |
+| `UPSTREAM_DIAL_TIMEOUT`     | `2s`     | connecting to the upstream                     |
+| `RATE_LIMIT_READ_RPS`, `RATE_LIMIT_READ_BURST`   | `50`, `100` | GET requests per second per client IP and burst |
+| `RATE_LIMIT_WRITE_RPS`, `RATE_LIMIT_WRITE_BURST` | `5`, `10`   | POST requests per second per client IP and burst |
+| `IDEMPOTENCY_TTL`           | `24h`    | how long a response is replayed                |
+| `IDEMPOTENCY_LOCK_TTL`      | `30s`    | lock of a request in progress (crash safety)   |
+| `LOG_LEVEL`, `SHUTDOWN_TIMEOUT` | `info`, `10s` | as in the services                     |
+
+Common variables of the services:
 
 | Variable                    | Default            | Description                              |
 |-----------------------------|--------------------|------------------------------------------|
@@ -210,6 +267,7 @@ Service-specific variables:
 
 ```
 cmd/<service>/                           entry points, configuration, dependency wiring
+internal/gateway/                        API gateway: routing, proxy, rate limiting, idempotency
 internal/<service>/domain/               business entities, domain events and errors
 internal/<service>/application/          use cases and ports
 internal/<service>/adapter/http/         HTTP delivery adapter
@@ -222,6 +280,7 @@ pkg/                                     shared infrastructure: logger, HTTP hel
 pkg/outbox/                              transactional outbox: storing messages and the relay
 pkg/rabbitmq/                            RabbitMQ connection, publisher with confirms, consumer
 pkg/events/                              integration event contracts shared between services
+pkg/redisclient/                         Redis client with fail-fast timeouts
 migrations/<service>/                    SQL migrations per service (golang-migrate)
 ```
 

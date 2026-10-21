@@ -20,9 +20,29 @@ type fakeRepo struct {
 	gotOffset int
 
 	statuses map[uuid.UUID]domain.Status
+	byKey    map[string]*domain.Order
+}
+
+func (f *fakeRepo) GetByIdempotencyKey(_ context.Context, key string) (*domain.Order, error) {
+	if order, ok := f.byKey[key]; ok {
+		return order, nil
+	}
+	return nil, domain.ErrNotFound
 }
 
 func (f *fakeRepo) Create(_ context.Context, order *domain.Order, events ...domain.Event) error {
+	if f.err != nil {
+		return f.err
+	}
+	if order.IdempotencyKey != "" {
+		if f.byKey == nil {
+			f.byKey = map[string]*domain.Order{}
+		}
+		if _, ok := f.byKey[order.IdempotencyKey]; ok {
+			return domain.ErrDuplicateIdempotencyKey
+		}
+		f.byKey[order.IdempotencyKey] = order
+	}
 	f.created = order
 	f.events = events
 	return f.err
@@ -70,10 +90,11 @@ func validInput() CreateOrderInput {
 
 func TestService_Create_CalculatesTotal(t *testing.T) {
 	repo := &fakeRepo{}
-	order, err := newTestService(repo).Create(context.Background(), validInput())
+	result, err := newTestService(repo).Create(context.Background(), validInput())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	order := result.Order
 	if want := int64(2*50000 + 3*1500); order.TotalAmount != want {
 		t.Errorf("total = %d, want %d", order.TotalAmount, want)
 	}
@@ -87,10 +108,11 @@ func TestService_Create_CalculatesTotal(t *testing.T) {
 
 func TestService_Create_SavesOrderCreatedEvent(t *testing.T) {
 	repo := &fakeRepo{}
-	order, err := newTestService(repo).Create(context.Background(), validInput())
+	result, err := newTestService(repo).Create(context.Background(), validInput())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	order := result.Order
 	if len(repo.events) != 1 {
 		t.Fatalf("got %d events, want 1", len(repo.events))
 	}
@@ -241,5 +263,70 @@ func TestService_LatePaymentEventDoesNotOverrideShipped(t *testing.T) {
 	}
 	if got := repo.statuses[id]; got != domain.StatusShipped {
 		t.Errorf("status = %q, want %q", got, domain.StatusShipped)
+	}
+}
+
+func TestService_Create_IdempotencyKeyReplaysOrder(t *testing.T) {
+	repo := &fakeRepo{}
+	svc := newTestService(repo)
+	in := validInput()
+	in.IdempotencyKey = "key-1"
+
+	first, err := svc.Create(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	second, err := svc.Create(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if first.Replayed || !second.Replayed {
+		t.Errorf("replayed = %v, %v, want false, true", first.Replayed, second.Replayed)
+	}
+	if first.Order.ID != second.Order.ID {
+		t.Errorf("replay returned order %s, want %s", second.Order.ID, first.Order.ID)
+	}
+}
+
+func TestService_Create_IdempotencyKeyWithDifferentBody(t *testing.T) {
+	svc := newTestService(&fakeRepo{})
+	in := validInput()
+	in.IdempotencyKey = "key-1"
+	if _, err := svc.Create(context.Background(), in); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	in.Items[0].Quantity++
+	if _, err := svc.Create(context.Background(), in); !errors.Is(err, domain.ErrIdempotencyKeyReused) {
+		t.Fatalf("expected ErrIdempotencyKeyReused, got %v", err)
+	}
+}
+
+// racingRepo emulates a concurrent request that created the order between the
+// replay check and the insert.
+type racingRepo struct {
+	fakeRepo
+	winner *domain.Order
+}
+
+func (r *racingRepo) Create(_ context.Context, order *domain.Order, _ ...domain.Event) error {
+	winner := *order
+	winner.ID = uuid.New()
+	r.winner = &winner
+	r.byKey = map[string]*domain.Order{order.IdempotencyKey: &winner}
+	return domain.ErrDuplicateIdempotencyKey
+}
+
+func TestService_Create_ConcurrentDuplicateReturnsWinner(t *testing.T) {
+	repo := &racingRepo{}
+	in := validInput()
+	in.IdempotencyKey = "key-1"
+
+	result, err := newTestService(repo).Create(context.Background(), in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.Replayed || result.Order.ID != repo.winner.ID {
+		t.Errorf("result = %+v, want the concurrently created order", result)
 	}
 }

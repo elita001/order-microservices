@@ -19,7 +19,7 @@ import (
 )
 
 type Service interface {
-	Create(ctx context.Context, in application.CreateOrderInput) (*domain.Order, error)
+	Create(ctx context.Context, in application.CreateOrderInput) (*application.CreateOrderResult, error)
 	Get(ctx context.Context, id uuid.UUID) (*domain.Order, error)
 	ListByCustomer(ctx context.Context, in application.ListOrdersInput) (*application.ListOrdersResult, error)
 }
@@ -93,16 +93,22 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		items = append(items, domain.Item{ProductID: item.ProductID, Quantity: item.Quantity, Price: item.Price})
 	}
 
-	order, err := h.service.Create(r.Context(), application.CreateOrderInput{
-		CustomerID: customerID,
-		Currency:   req.Currency,
-		Items:      items,
+	result, err := h.service.Create(r.Context(), application.CreateOrderInput{
+		CustomerID:     customerID,
+		Currency:       req.Currency,
+		Items:          items,
+		IdempotencyKey: r.Header.Get(httpx.IdempotencyKeyHeader),
 	})
 	if err != nil {
 		h.handleError(w, r, err)
 		return
 	}
-	httpx.WriteJSON(w, http.StatusCreated, toResponse(order))
+	// A replay returns the original response, so the client cannot tell it from the first one,
+	// except for this informational header.
+	if result.Replayed {
+		w.Header().Set(httpx.IdempotentReplayedHeader, "true")
+	}
+	httpx.WriteJSON(w, http.StatusCreated, toResponse(result.Order))
 }
 
 func (h *Handler) getOrder(w http.ResponseWriter, r *http.Request) {
@@ -157,6 +163,8 @@ func (h *Handler) handleError(w http.ResponseWriter, r *http.Request, err error)
 		httpx.WriteError(w, http.StatusUnprocessableEntity, "validation_error", validationErr.Error())
 	case errors.Is(err, domain.ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, "not_found", "order not found")
+	case errors.Is(err, domain.ErrIdempotencyKeyReused):
+		httpx.WriteError(w, http.StatusUnprocessableEntity, "idempotency_key_reused", err.Error())
 	default:
 		logger.FromContext(r.Context()).Error("request failed", "error", err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "internal server error")

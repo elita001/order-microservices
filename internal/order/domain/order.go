@@ -34,9 +34,22 @@ type Order struct {
 	Currency    string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+
+	// IdempotencyKey is the client's Idempotency-Key header (empty if not sent), and
+	// RequestHash identifies the request body, so a reused key with another body is rejected.
+	IdempotencyKey string
+	RequestHash    string
 }
 
 var ErrNotFound = errors.New("order not found")
+
+// ErrDuplicateIdempotencyKey is returned by the repository when an order with the same
+// idempotency key already exists (e.g., created by a concurrent request).
+var ErrDuplicateIdempotencyKey = errors.New("order with this idempotency key already exists")
+
+// ErrIdempotencyKeyReused means the client sent an idempotency key that was already
+// used for a request with a different body.
+var ErrIdempotencyKeyReused = errors.New("idempotency key was already used for a different request")
 
 // ValidationError represents an input error that can be shown to the client.
 type ValidationError struct {

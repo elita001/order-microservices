@@ -11,7 +11,7 @@ down:          ## stop everything (add -v to remove database data)
 	docker compose down
 
 logs:          ## follow application logs
-	docker compose logs -f order payment delivery notification
+	docker compose logs -f gateway order payment delivery notification
 
 ps:
 	docker compose ps

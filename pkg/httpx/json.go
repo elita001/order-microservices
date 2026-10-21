@@ -9,6 +9,14 @@ import (
 
 const maxBodyBytes = 1 << 20 // 1 MiB
 
+const (
+	// IdempotencyKeyHeader lets a client retry a non-idempotent request (POST) safely:
+	// requests with the same key are executed once.
+	IdempotencyKeyHeader = "Idempotency-Key"
+	// IdempotentReplayedHeader marks a response replayed for a repeated idempotency key.
+	IdempotentReplayedHeader = "Idempotent-Replayed"
+)
+
 type ErrorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
