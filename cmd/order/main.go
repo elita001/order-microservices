@@ -36,6 +36,9 @@ type config struct {
 	PostgresDSN     string        `env:"POSTGRES_DSN,required"`
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
+	// Shorter than the gateway's UPSTREAM_TIMEOUT, so the service answers itself
+	// (503 if the database hangs) instead of the gateway answering 504.
+	RequestTimeout time.Duration `env:"REQUEST_TIMEOUT" envDefault:"3s"`
 
 	RabbitMQURL      string `env:"RABBITMQ_URL,required"`
 	RabbitMQExchange string `env:"RABBITMQ_EXCHANGE" envDefault:"orderflow.events"`
@@ -77,7 +80,7 @@ func run() error {
 	defer publisher.Close()
 	relay := outbox.NewRelay(pool, orderpostgres.OutboxTable, publisher, cfg.Outbox, log)
 
-	rdb, err := redisclient.New(cfg.Redis)
+	rdb, err := redisclient.New(cfg.Redis, log)
 	if err != nil {
 		return fmt.Errorf("create redis client: %w", err)
 	}
@@ -97,12 +100,15 @@ func run() error {
 		Exchange:    cfg.RabbitMQExchange,
 		Queue:       cfg.RabbitMQQueue,
 		RoutingKeys: eventHandler.RoutingKeys(),
-	}, cfg.Consumer, log)
+	}, cfg.Consumer, log).WithHealthCheck(pool.Ping)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, httpx.Logger(log), httpx.Recoverer)
 	httpx.RegisterHealth(r, pool.Ping)
-	r.Route("/api/v1", httpHandler.Register)
+	r.Route("/api/v1", func(r chi.Router) {
+		r.Use(httpx.Timeout(cfg.RequestTimeout))
+		httpHandler.Register(r)
+	})
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,

@@ -20,6 +20,7 @@ import (
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
 	"github.com/elita001/order-microservices/internal/gateway/proxy"
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
+	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/redisclient"
 )
@@ -79,7 +80,8 @@ func newRedisClient(t *testing.T, addr string) *redis.Client {
 		DialTimeout:  2 * time.Second,
 		ReadTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
-	})
+		Breaker:      breaker.Config{Failures: 5, OpenTimeout: time.Minute, HalfOpenRequests: 1},
+	}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("create redis client: %v", err)
 	}

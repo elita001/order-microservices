@@ -38,6 +38,11 @@ func (f *fakeRepo) SendOnce(ctx context.Context, n *domain.Notification, send fu
 	return true, nil
 }
 
+func (f *fakeRepo) Sent(_ context.Context, kind domain.Kind, orderID uuid.UUID) (bool, error) {
+	_, ok := f.sent[notificationKey{kind, orderID}]
+	return ok, nil
+}
+
 type fakeCustomers struct{}
 
 func (fakeCustomers) Email(_ context.Context, id uuid.UUID) (string, error) {
@@ -137,6 +142,8 @@ func TestService_DifferentKindsAreSentSeparately(t *testing.T) {
 	steps := []error{
 		svc.NotifyPaymentFailed(context.Background(), PaymentFailedInput{
 			OrderID: orderID, CustomerID: customerID, Amount: 100, Currency: "USD", Reason: "insufficient_funds"}),
+		svc.NotifyPaymentSucceeded(context.Background(), PaymentSucceededInput{
+			OrderID: orderID, CustomerID: customerID, Amount: 100, Currency: "USD", TransactionID: "tx"}),
 		svc.NotifyOrderShipped(context.Background(), OrderShippedInput{
 			OrderID: orderID, CustomerID: customerID, Carrier: "CDEK", TrackingNumber: "OF1",
 			EstimatedDeliveryAt: time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)}),
@@ -146,14 +153,14 @@ func TestService_DifferentKindsAreSentSeparately(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
-	if len(mailer.sent) != 2 {
-		t.Fatalf("sent %d emails, want 2", len(mailer.sent))
+	if len(mailer.sent) != 3 {
+		t.Fatalf("sent %d emails, want 3", len(mailer.sent))
 	}
 	if !strings.Contains(mailer.sent[0].Text, "Reason: insufficient funds") {
 		t.Errorf("payment failed email: %s", mailer.sent[0].Text)
 	}
-	if !strings.Contains(mailer.sent[1].Text, "Estimated delivery: October 25, 2026") {
-		t.Errorf("shipped email: %s", mailer.sent[1].Text)
+	if !strings.Contains(mailer.sent[2].Text, "Estimated delivery: October 25, 2026") {
+		t.Errorf("shipped email: %s", mailer.sent[2].Text)
 	}
 }
 
@@ -183,5 +190,31 @@ func TestContent_HTMLEscapesEventData(t *testing.T) {
 	}
 	if strings.Contains(html, "<script>") {
 		t.Error("product ID is not escaped in HTML")
+	}
+}
+
+func TestService_ShippedEmailWaitsForPaymentEmail(t *testing.T) {
+	mailer := &fakeMailer{}
+	svc := NewService(newFakeRepo(), fakeCustomers{}, mailer, discardLogger{})
+	orderID, customerID := uuid.New(), uuid.New()
+	shipped := OrderShippedInput{OrderID: orderID, CustomerID: customerID, Carrier: "CDEK", TrackingNumber: "OF1"}
+
+	err := svc.NotifyOrderShipped(context.Background(), shipped)
+	if !errors.Is(err, ErrOutOfOrder) || IsPermanentError(err) {
+		t.Fatalf("expected a retryable ErrOutOfOrder, got %v", err)
+	}
+	if len(mailer.sent) != 0 {
+		t.Fatalf("sent %d emails before the payment email, want 0", len(mailer.sent))
+	}
+
+	if err := svc.NotifyPaymentSucceeded(context.Background(), PaymentSucceededInput{
+		OrderID: orderID, CustomerID: customerID, Amount: 100, Currency: "RUB", TransactionID: "tx"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.NotifyOrderShipped(context.Background(), shipped); err != nil { // the retry
+		t.Fatalf("unexpected error on retry: %v", err)
+	}
+	if len(mailer.sent) != 2 || !strings.Contains(mailer.sent[1].Subject, "shipped") {
+		t.Errorf("emails = %+v, want payment then shipped", mailer.sent)
 	}
 }

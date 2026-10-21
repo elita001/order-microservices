@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/elita001/order-microservices/internal/order/application"
 	"github.com/elita001/order-microservices/internal/order/domain"
+	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/redisclient"
 )
 
@@ -61,7 +63,8 @@ func newTestEnv(t *testing.T) *testEnv {
 	mr := miniredis.RunT(t)
 	rdb, err := redisclient.New(redisclient.Config{
 		URL: "redis://" + mr.Addr(), DialTimeout: 2 * time.Second, ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second,
-	})
+		Breaker: breaker.Config{Failures: 3, OpenTimeout: time.Minute, HalfOpenRequests: 1},
+	}, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +80,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	return &testEnv{
 		db:    db,
 		redis: mr,
-		cache: New(db, rdb, Config{TTL: time.Minute}, 100*time.Millisecond, slog.New(slog.DiscardHandler)),
+		cache: New(db, rdb, Config{TTL: time.Minute, LoadTimeout: time.Second}, 100*time.Millisecond, slog.New(slog.DiscardHandler)),
 		order: order,
 	}
 }
@@ -151,6 +154,52 @@ func TestCache_ConcurrentMissesShareOneQuery(t *testing.T) {
 	wg.Wait()
 	if reads := env.db.reads.Load(); reads != 1 {
 		t.Errorf("database read %d times, want 1", reads)
+	}
+}
+
+// The shared load must not fail for everyone when the caller that started it gives up.
+func TestCache_CanceledFirstCallerDoesNotFailOthers(t *testing.T) {
+	env := newTestEnv(t)
+	env.db.delay = 100 * time.Millisecond
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := env.cache.GetByID(firstCtx, env.order.ID)
+		firstErr <- err
+	}()
+	time.Sleep(20 * time.Millisecond) // the first caller has started the shared load
+	cancelFirst()
+
+	if got := env.get(t); got.ID != env.order.ID { // joins the same load
+		t.Fatalf("got order %s", got.ID)
+	}
+	if err := <-firstErr; !errors.Is(err, context.Canceled) {
+		t.Errorf("first caller: got %v, want context.Canceled", err)
+	}
+	if reads := env.db.reads.Load(); reads != 1 {
+		t.Errorf("database read %d times, want 1", reads)
+	}
+}
+
+// After a few failures the breaker opens, and requests stop waiting for Redis at all.
+func TestCache_BreakerSkipsHangingRedis(t *testing.T) {
+	env := newTestEnv(t)
+	addr := env.redis.Addr()
+	env.redis.Close()
+	listener, err := net.Listen("tcp", addr) // accepts connections, never answers
+	if err != nil {
+		t.Skipf("cannot listen on the Redis address: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	for range 3 { // each waits for the 100ms Redis timeout and opens the breaker
+		env.get(t)
+	}
+	start := time.Now()
+	env.get(t)
+	if elapsed := time.Since(start); elapsed > 20*time.Millisecond {
+		t.Errorf("request with an open breaker took %v, want no Redis wait", elapsed)
 	}
 }
 

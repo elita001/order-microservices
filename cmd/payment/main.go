@@ -19,6 +19,7 @@ import (
 	paymentpostgres "github.com/elita001/order-microservices/internal/payment/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/payment/adapter/provider"
 	"github.com/elita001/order-microservices/internal/payment/application"
+	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -42,6 +43,7 @@ type config struct {
 	Outbox   outbox.RelayConfig      `envPrefix:"OUTBOX_"`
 	Consumer rabbitmq.ConsumerConfig `envPrefix:"CONSUMER_"`
 	Provider provider.StubConfig     `envPrefix:"PAYMENT_STUB_"`
+	Breaker  breaker.Config          `envPrefix:"PROVIDER_BREAKER_"`
 }
 
 func main() {
@@ -75,14 +77,14 @@ func run() error {
 	relay := outbox.NewRelay(pool, paymentpostgres.OutboxTable, publisher, cfg.Outbox, log)
 
 	repo := paymentpostgres.NewRepository(pool)
-	svc := application.NewService(repo, provider.NewStub(cfg.Provider), log)
+	svc := application.NewService(repo, provider.WithBreaker(provider.NewStub(cfg.Provider), cfg.Breaker, log), log)
 	eventHandler := paymentmessaging.NewHandler(svc)
 
 	consumer := rabbitmq.NewConsumer(cfg.RabbitMQURL, serviceName, rabbitmq.Topology{
 		Exchange:    cfg.RabbitMQExchange,
 		Queue:       cfg.RabbitMQQueue,
 		RoutingKeys: eventHandler.RoutingKeys(),
-	}, cfg.Consumer, log)
+	}, cfg.Consumer, log).WithHealthCheck(pool.Ping)
 
 	// The payment service has no public API yet; HTTP serves health probes
 	// (and metrics in a later step).

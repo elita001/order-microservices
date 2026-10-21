@@ -16,6 +16,7 @@ import (
 	"github.com/elita001/order-microservices/internal/order/domain"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/postgres"
 )
 
 type Service interface {
@@ -165,6 +166,11 @@ func (h *Handler) handleError(w http.ResponseWriter, r *http.Request, err error)
 		httpx.WriteError(w, http.StatusNotFound, "not_found", "order not found")
 	case errors.Is(err, domain.ErrIdempotencyKeyReused):
 		httpx.WriteError(w, http.StatusUnprocessableEntity, "idempotency_key_reused", err.Error())
+	case postgres.IsUnavailable(err):
+		// A temporary condition, not a bug: clients and load balancers should retry later.
+		logger.FromContext(r.Context()).Error("database unavailable", "error", err)
+		w.Header().Set("Retry-After", "5")
+		httpx.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "service is temporarily unavailable, retry later")
 	default:
 		logger.FromContext(r.Context()).Error("request failed", "error", err)
 		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "internal server error")

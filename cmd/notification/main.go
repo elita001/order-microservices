@@ -77,7 +77,7 @@ func run() error {
 		Exchange:    cfg.RabbitMQExchange,
 		Queue:       cfg.RabbitMQQueue,
 		RoutingKeys: eventHandler.RoutingKeys(),
-	}, cfg.Consumer, log)
+	}, cfg.Consumer, log).WithHealthCheck(pool.Ping)
 
 	// The notification service has no public API; HTTP serves health probes
 	// (and metrics in a later step).

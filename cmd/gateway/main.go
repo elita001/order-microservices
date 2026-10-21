@@ -64,7 +64,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	rdb, err := redisclient.New(cfg.Redis)
+	rdb, err := redisclient.New(cfg.Redis, log)
 	if err != nil {
 		return fmt.Errorf("create redis client: %w", err)
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -48,6 +49,17 @@ func (r *Repository) SendOnce(ctx context.Context, n *domain.Notification, send 
 	})
 	if err != nil {
 		return false, err
+	}
+	return sent, nil
+}
+
+func (r *Repository) Sent(ctx context.Context, kind domain.Kind, orderID uuid.UUID) (bool, error) {
+	var sent bool
+	err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM notifications WHERE kind = $1 AND order_id = $2)`,
+		string(kind), orderID).Scan(&sent)
+	if err != nil {
+		return false, fmt.Errorf("check notification: %w", err)
 	}
 	return sent, nil
 }

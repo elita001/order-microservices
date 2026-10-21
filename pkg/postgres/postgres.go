@@ -19,6 +19,12 @@ func Connect(ctx context.Context, dsn string, log *slog.Logger) (*pgxpool.Pool, 
 		return nil, fmt.Errorf("parse dsn: %w", err)
 	}
 
+	// Without it a connection attempt to an unreachable host waits for the OS TCP timeout,
+	// far longer than any request should.
+	if cfg.ConnConfig.ConnectTimeout == 0 {
+		cfg.ConnConfig.ConnectTimeout = 3 * time.Second
+	}
+
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pool: %w", err)

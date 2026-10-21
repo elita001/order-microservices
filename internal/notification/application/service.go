@@ -18,6 +18,8 @@ type Repository interface {
 	// notification of the same kind was already sent for the order, it returns false
 	// without calling send. If send fails, nothing is recorded, so a retry sends again.
 	SendOnce(ctx context.Context, n *domain.Notification, send func(ctx context.Context) error) (bool, error)
+	// Sent reports whether a notification of this kind has been sent for the order.
+	Sent(ctx context.Context, kind domain.Kind, orderID uuid.UUID) (bool, error)
 }
 
 // CustomerDirectory is the port of the service that knows customers' contact details.
@@ -39,6 +41,9 @@ type Email struct {
 
 // ErrInvalidRecipient means the email address is rejected; retrying cannot help.
 var ErrInvalidRecipient = errors.New("invalid recipient")
+
+// ErrOutOfOrder means an event arrived before the one it follows; it is retried later.
+var ErrOutOfOrder = errors.New("event arrived before the event it follows")
 
 // Logger is the logging capability required by the application service.
 type Logger interface {
@@ -113,7 +118,20 @@ func (s *Service) NotifyPaymentFailed(ctx context.Context, in PaymentFailedInput
 	return s.notify(ctx, domain.KindPaymentFailed, in.OrderID, in.CustomerID, paymentFailedContent(in))
 }
 
+// NotifyOrderShipped sends the "shipped" email only after the "payment received" one.
+// Events from different services can arrive in any order; a shipment is created only
+// after a successful payment, so a missing payment email means its event is still on
+// the way, and this one is retried with backoff until it arrives.
 func (s *Service) NotifyOrderShipped(ctx context.Context, in OrderShippedInput) error {
+	if in.OrderID != uuid.Nil {
+		paymentSent, err := s.repo.Sent(ctx, domain.KindPaymentSucceeded, in.OrderID)
+		if err != nil {
+			return fmt.Errorf("check payment notification for order %s: %w", in.OrderID, err)
+		}
+		if !paymentSent {
+			return fmt.Errorf("%w: the payment email for order %s has not been sent yet", ErrOutOfOrder, in.OrderID)
+		}
+	}
 	return s.notify(ctx, domain.KindOrderShipped, in.OrderID, in.CustomerID, orderShippedContent(in))
 }
 

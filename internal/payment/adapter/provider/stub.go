@@ -3,6 +3,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
@@ -14,14 +15,19 @@ import (
 // StubConfig is usually loaded from environment variables with the PAYMENT_STUB_ prefix.
 type StubConfig struct {
 	FailureRate float64       `env:"FAILURE_RATE" envDefault:"0.2"` // share of declined payments, 0..1
+	ErrorRate   float64       `env:"ERROR_RATE" envDefault:"0"`     // share of calls failing with a technical error, 0..1
 	MinDelay    time.Duration `env:"MIN_DELAY" envDefault:"100ms"`
 	MaxDelay    time.Duration `env:"MAX_DELAY" envDefault:"1s"`
 }
 
 var declineReasons = []string{"insufficient_funds", "card_declined", "card_expired"}
 
-// Stub simulates an external payment provider: it responds with a random delay and
-// declines a share of payments.
+// ErrUnavailable is a simulated technical failure of the provider's API.
+var ErrUnavailable = errors.New("payment provider API is temporarily unavailable")
+
+// Stub simulates an external payment provider: it responds with a random delay, declines
+// a share of payments (a business outcome), and fails a share of calls with a technical
+// error (the caller retries; set ERROR_RATE=1 to simulate an outage).
 //
 // Like a real provider, it is idempotent: the outcome is derived from the idempotency
 // key, so a retry of the same payment always gets the same answer.
@@ -40,6 +46,10 @@ func (s *Stub) Charge(ctx context.Context, req application.ChargeRequest) (appli
 	case <-ctx.Done():
 		return application.ChargeResult{}, fmt.Errorf("payment provider: %w", ctx.Err())
 	case <-time.After(s.delay()):
+	}
+	// Technical errors are random, not derived from the key: a retry may succeed.
+	if rand.Float64() < s.cfg.ErrorRate {
+		return application.ChargeResult{}, ErrUnavailable
 	}
 
 	h := fnv.New64a()

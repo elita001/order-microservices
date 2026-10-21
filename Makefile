@@ -1,4 +1,9 @@
-.PHONY: up down logs ps test tidy migrate-new outbox orders
+# Local settings (ports, credentials) for the targets that talk to the services from the host.
+-include .env
+RABBITMQ_URL ?= amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@localhost:$(or $(RABBITMQ_PORT),5672)/
+SERVICE_QUEUES = order-service payment-service delivery-service notification-service
+
+.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues
 
 up: .env      ## build and start everything
 	docker compose up -d --build --remove-orphans
@@ -41,3 +46,13 @@ tidy:
 migrate-new:   ## make migrate-new service=payment name=add_refunds
 	docker run --rm -v $(PWD)/migrations/$(service):/migrations migrate/migrate:v4.17.1 \
 		create -ext sql -dir /migrations -seq $(name)
+
+dlq-list:      ## show dead-lettered messages: make dlq-list queue=payment-service
+	RABBITMQ_URL='$(RABBITMQ_URL)' go run ./cmd/dlq list -queue $(queue)
+
+dlq-replay:    ## move dead-lettered messages back for processing: make dlq-replay queue=payment-service
+	RABBITMQ_URL='$(RABBITMQ_URL)' go run ./cmd/dlq replay -queue $(queue) -limit 1000
+
+rabbitmq-reset-queues: ## DEVELOPMENT ONLY: delete the service queues (and their messages), e.g. after queue arguments changed
+	for q in $(SERVICE_QUEUES); do docker compose exec rabbitmq rabbitmqctl delete_queue $$q; done
+	docker compose restart order payment delivery notification

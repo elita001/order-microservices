@@ -73,6 +73,8 @@ Useful commands:
 | `make orders`   | latest orders with their payment, shipment, and sent emails |
 | `make outbox`   | latest outbox messages of all services and their delivery state |
 | `make test`     | unit tests with the race detector                    |
+| `make dlq-list queue=payment-service`   | show dead-lettered messages with their errors |
+| `make dlq-replay queue=payment-service` | move dead-lettered messages back for processing |
 
 ## Example requests
 
@@ -208,9 +210,79 @@ after the broker confirm but before `published_at` is saved), so every handler i
   the row back so that a retry sends again. A crash right after sending can still cause
   a rare duplicate email: SMTP offers no stronger guarantee.
 
-Consumer error handling: a malformed message is rejected (it cannot succeed on retry); any
-other error (e.g., the database is down) requeues the message after `CONSUMER_REQUEUE_DELAY`.
-Quorum queues drop a message after 20 redeliveries, so a poison message cannot loop forever.
+
+## Reliability
+
+The goal: a message can be delayed, but it is never lost silently. It is either processed
+or parked in a dead letter queue, and the failure is visible.
+
+### Retries with backoff and dead letter queues
+
+Every consuming service has a queue, retry queues, and a dead letter queue (DLQ):
+
+```
+payment-service ──failure──▶ payment-service.retry.<delay> ──TTL──▶ payment-service
+       │                     (1s, 5s, 30s, 2m, 10m; no consumers)
+       └──permanent error or retries exhausted──▶ payment-service.dlq
+```
+
+- **Transient errors** (a provider timeout, an open circuit breaker): the consumer publishes
+  a copy to the retry queue of the next delay and acks the original; when the TTL expires,
+  RabbitMQ dead-letters it back. The handler is not blocked, and the queue is not flooded
+  with immediate redeliveries.
+- **Permanent errors** (malformed JSON, invalid data) and **exhausted retries**: the message
+  goes to the DLQ with `x-error`, `x-retry-count`, `x-original-queue`, and `x-failed-at`.
+- **Panics** in handlers are recovered and treated as transient errors.
+- **Safety net:** the queue itself dead-letters to the DLQ after 20 redeliveries (e.g., if
+  the process crashes on a message every time), with at-least-once dead-lettering.
+
+Working with the DLQ, as in production: alert when it is not empty (step 8), find the cause
+by `message_id` in the logs, fix it, and replay. Handlers are idempotent, so replaying is safe:
+
+```bash
+make dlq-list queue=payment-service     # what failed and why
+make dlq-replay queue=payment-service   # back to processing with a fresh retry budget
+```
+
+### Circuit breakers
+
+After 5 consecutive failures a breaker opens: calls fail immediately instead of waiting for
+timeouts, and after `OPEN_TIMEOUT` a trial call checks whether the dependency recovered.
+
+| Breaker | Protects | While open |
+|---------|----------|------------|
+| Redis (gateway, order cache) | every request from waiting `REDIS_OPERATION_TIMEOUT` | rate limiting and the cache are skipped (fail-open); requests take ~2ms instead of ~900ms |
+| Payment provider | the provider from a flood of calls, consumers from timeouts | payments fail fast and are retried with backoff |
+| Carrier | the same for shipments | shipments are retried with backoff |
+
+Only infrastructure errors count: a declined payment or a Redis error reply (`redis.Nil`)
+means the dependency works. Set `PAYMENT_STUB_ERROR_RATE=1` to see the payment breaker open.
+
+### Database outages
+
+- Consumers check the database every `CONSUMER_HEALTH_INTERVAL` and **pause** while it is
+  down: messages wait in the queue instead of failing and using up their retries.
+- HTTP requests get `503` with `Retry-After` instead of `500`: it is a temporary condition,
+  not a bug. Every request has a deadline (`REQUEST_TIMEOUT`, 3s) shorter than the gateway's
+  upstream timeout (5s), so the service answers before the gateway gives up.
+- Readiness (`/readyz`) fails, so an orchestrator stops routing traffic, but liveness
+  (`/healthz`) does not, so it does not restart the service in a loop.
+
+### Out-of-order events
+
+Notification Service sends the "order shipped" email only after "payment received": if
+`delivery.created` arrives first, the handler returns a transient error and the event is
+retried with backoff until the payment event has been handled.
+
+### Upgrading an existing environment
+
+RabbitMQ refuses to redeclare an existing queue with different arguments. If a service logs
+"a queue exists with different arguments", delete the old queues (development only, their
+messages are lost) and the services will recreate them:
+
+```bash
+make rabbitmq-reset-queues
+```
 
 ### External service stubs
 
@@ -234,6 +306,7 @@ API gateway:
 | `ORDER_SERVICE_URL`         | — (required) | Order Service base URL                     |
 | `REDIS_URL`                 | — (required) | `redis://:password@host:6379/0`            |
 | `REDIS_OPERATION_TIMEOUT`   | `300ms`  | one Redis call including dialing and retries   |
+| `REDIS_BREAKER_FAILURES`, `REDIS_BREAKER_OPEN_TIMEOUT` | `5`, `30s` | circuit breaker of Redis (also in Order Service) |
 | `REDIS_DIAL_TIMEOUT`, `REDIS_READ_TIMEOUT`, `REDIS_WRITE_TIMEOUT` | `500ms`, `200ms`, `200ms` | Redis client timeouts |
 | `UPSTREAM_TIMEOUT`          | `5s`     | whole upstream request                         |
 | `UPSTREAM_DIAL_TIMEOUT`     | `2s`     | connecting to the upstream                     |
@@ -250,6 +323,8 @@ Order Service cache:
 | `REDIS_URL`               | — (required) | `redis://:password@host:6379/0`                 |
 | `REDIS_OPERATION_TIMEOUT` | `300ms` | one Redis call; on timeout the database is used      |
 | `CACHE_TTL`               | `5m`    | lifetime of a cached order (+ up to 10% jitter)      |
+| `CACHE_LOAD_TIMEOUT`      | `5s`    | a database load shared by concurrent misses          |
+| `REQUEST_TIMEOUT`         | `3s`    | deadline of every API request (shorter than the gateway's) |
 
 Common variables of the services:
 
@@ -272,7 +347,9 @@ Common variables of the services:
 | `CONSUMER_PREFETCH`         | `10`               | unacknowledged messages per connection   |
 | `CONSUMER_CONCURRENCY`      | `4`                | messages handled in parallel             |
 | `CONSUMER_HANDLER_TIMEOUT`  | `10s`              | a started handler is finished on shutdown |
-| `CONSUMER_REQUEUE_DELAY`    | `1s`               | pause before requeueing a failed message |
+| `CONSUMER_RETRY_DELAYS`     | `1s,5s,30s,2m,10m` | pauses before each retry; then the DLQ   |
+| `CONSUMER_HEALTH_INTERVAL`  | `5s`               | database check; consumption pauses while it fails |
+| `CONSUMER_REQUEUE_DELAY`    | `1s`               | pause before requeueing if forwarding to a retry queue fails |
 | `CONSUMER_MAX_BACKOFF`      | `30s`              | maximum pause between reconnects         |
 
 The notification service has no outbox, so the `OUTBOX_*` variables do not apply to it.
@@ -282,6 +359,9 @@ Service-specific variables:
 | Service      | Variable                    | Default | Description                              |
 |--------------|-----------------------------|---------|------------------------------------------|
 | payment      | `PAYMENT_STUB_FAILURE_RATE` | `0.2`   | share of declined payments, 0..1         |
+| payment      | `PAYMENT_STUB_ERROR_RATE`   | `0`     | share of calls failing with a technical error, 0..1 |
+| payment      | `PROVIDER_BREAKER_FAILURES`, `PROVIDER_BREAKER_OPEN_TIMEOUT` | `5`, `30s` | circuit breaker of the payment provider |
+| delivery     | `CARRIER_BREAKER_FAILURES`, `CARRIER_BREAKER_OPEN_TIMEOUT`   | `5`, `30s` | circuit breaker of the carrier |
 | payment      | `PAYMENT_STUB_MIN_DELAY`    | `100ms` | minimum provider response time           |
 | payment      | `PAYMENT_STUB_MAX_DELAY`    | `1s`    | maximum provider response time           |
 | delivery     | `DELIVERY_STUB_ERROR_RATE`  | `0.1`   | share of carrier calls failing with a technical error |
@@ -310,7 +390,9 @@ pkg/                                     shared infrastructure: logger, HTTP hel
 pkg/outbox/                              transactional outbox: storing messages and the relay
 pkg/rabbitmq/                            RabbitMQ connection, publisher with confirms, consumer
 pkg/events/                              integration event contracts shared between services
-pkg/redisclient/                         Redis client with fail-fast timeouts
+pkg/redisclient/                         Redis client with fail-fast timeouts and a circuit breaker
+pkg/breaker/                             circuit breakers for dependencies
+cmd/dlq/                                 tool to inspect and replay dead letter queues
 internal/order/adapter/cache/            cache-aside decorator of the order repository
 migrations/<service>/                    SQL migrations per service (golang-migrate)
 ```

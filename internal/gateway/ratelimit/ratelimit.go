@@ -3,6 +3,7 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"github.com/go-redis/redis_rate/v10"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
 )
@@ -47,7 +49,9 @@ func (l *Limiter) Middleware(policy Policy) func(http.Handler) http.Handler {
 			res, err := l.limiter.Allow(ctx, key, limit)
 			cancel()
 			if err != nil {
-				logger.FromContext(r.Context()).Warn("rate limiter unavailable, request allowed", "error", err)
+				if !errors.Is(err, breaker.ErrOpen) { // an open breaker is logged once by itself
+					logger.FromContext(r.Context()).Warn("rate limiter unavailable, request allowed", "error", err)
+				}
 				next.ServeHTTP(w, r)
 				return
 			}

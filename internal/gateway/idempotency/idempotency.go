@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
 )
@@ -92,7 +94,7 @@ func (s *Store) Middleware(next http.Handler) http.Handler {
 		acquired, err := s.rdb.SetNX(ctx, redisKey, lock, s.cfg.LockTTL).Result()
 		cancel()
 		if err != nil {
-			log.Warn("idempotency store unavailable, relying on the upstream service", "error", err)
+			warnUnavailable(log, err)
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -116,7 +118,7 @@ func (s *Store) handleRepeat(w http.ResponseWriter, r *http.Request, next http.H
 	if err != nil {
 		// The entry expired in between, or Redis failed: the upstream service deduplicates.
 		if !errors.Is(err, redis.Nil) {
-			log.Warn("idempotency store unavailable, relying on the upstream service", "error", err)
+			warnUnavailable(log, err)
 		}
 		next.ServeHTTP(w, r)
 		return
@@ -154,7 +156,7 @@ func (s *Store) save(ctx context.Context, redisKey, fingerprint string, rec *rec
 	log := logger.FromContext(ctx)
 
 	if rec.status >= http.StatusInternalServerError {
-		if err := s.rdb.Del(ctx, redisKey).Err(); err != nil {
+		if err := s.rdb.Del(ctx, redisKey).Err(); err != nil && !errors.Is(err, breaker.ErrOpen) {
 			log.Warn("release idempotency key", "error", err) // the lock expires after LockTTL
 		}
 		return
@@ -176,9 +178,16 @@ func (s *Store) save(ctx context.Context, redisKey, fingerprint string, rec *rec
 	if err == nil {
 		err = s.rdb.Set(ctx, redisKey, data, s.cfg.TTL).Err()
 	}
-	if err != nil {
+	if err != nil && !errors.Is(err, breaker.ErrOpen) {
 		// Not critical: repeats go upstream, where the database deduplicates them.
 		log.Warn("save idempotent response", "error", err)
+	}
+}
+
+// warnUnavailable logs a Redis failure; an open breaker is logged once by itself.
+func warnUnavailable(log *slog.Logger, err error) {
+	if !errors.Is(err, breaker.ErrOpen) {
+		log.Warn("idempotency store unavailable, relying on the upstream service", "error", err)
 	}
 }
 

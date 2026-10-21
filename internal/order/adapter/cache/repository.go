@@ -8,6 +8,7 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/elita001/order-microservices/internal/order/application"
 	"github.com/elita001/order-microservices/internal/order/domain"
+	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/logger"
 )
 
@@ -30,6 +32,8 @@ type Config struct {
 	// at that moment). A random jitter of up to 10% is added, so entries cached at
 	// the same time do not expire at the same time.
 	TTL time.Duration `env:"TTL" envDefault:"5m"`
+	// LoadTimeout bounds a database load shared by concurrent misses (see GetByID).
+	LoadTimeout time.Duration `env:"LOAD_TIMEOUT" envDefault:"5s"`
 }
 
 // keyPrefix includes a format version: changing cachedOrder requires a new version,
@@ -86,8 +90,12 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, 
 	}
 
 	// Concurrent misses for the same order share one database query (no stampede
-	// when a popular entry expires).
-	v, err, _ := r.loads.Do(id.String(), func() (any, error) {
+	// when a popular entry expires). The shared load is detached from the caller that
+	// started it: if that client disconnects, the others still get the order. Each caller
+	// waits only as long as its own context allows.
+	loaded := r.loads.DoChan(id.String(), func() (any, error) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.cfg.LoadTimeout)
+		defer cancel()
 		order, err := r.Repository.GetByID(ctx, id)
 		if err != nil {
 			return nil, err
@@ -95,11 +103,16 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, 
 		r.set(ctx, order)
 		return order, nil
 	})
-	if err != nil {
-		return nil, err
+	select {
+	case res := <-loaded:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		order := *res.Val.(*domain.Order) // callers must not share one struct
+		return &order, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	order := *v.(*domain.Order) // callers must not share one struct
-	return &order, nil
 }
 
 func (r *Repository) UpdateStatus(ctx context.Context, id uuid.UUID, from []domain.Status, to domain.Status, updatedAt time.Time) (bool, error) {
@@ -165,6 +178,9 @@ func (r *Repository) store(ctx context.Context, id uuid.UUID, version time.Time,
 }
 
 func (r *Repository) warn(ctx context.Context, msg string, err error) {
+	if errors.Is(err, breaker.ErrOpen) {
+		return // an open breaker is logged once by itself
+	}
 	logger.FromContext(ctx).Warn(msg+" failed, using the database", "component", "order_cache", "error", err)
 }
 
