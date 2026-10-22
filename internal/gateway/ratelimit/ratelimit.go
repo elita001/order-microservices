@@ -49,6 +49,7 @@ func (l *Limiter) Middleware(policy Policy) func(http.Handler) http.Handler {
 			res, err := l.limiter.Allow(ctx, key, limit)
 			cancel()
 			if err != nil {
+				decisions.WithLabelValues(policy.Name, "bypassed").Inc()
 				if !errors.Is(err, breaker.ErrOpen) { // an open breaker is logged once by itself
 					logger.FromContext(r.Context()).Warn("rate limiter unavailable, request allowed", "error", err)
 				}
@@ -59,11 +60,13 @@ func (l *Limiter) Middleware(policy Policy) func(http.Handler) http.Handler {
 			w.Header().Set("X-RateLimit-Limit", limitHeader)
 			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(res.Remaining))
 			if res.Allowed == 0 {
+				decisions.WithLabelValues(policy.Name, "rejected").Inc()
 				retryAfter := int(math.Ceil(res.RetryAfter.Seconds()))
 				w.Header().Set("Retry-After", strconv.Itoa(max(retryAfter, 1)))
 				httpx.WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests, retry later")
 				return
 			}
+			decisions.WithLabelValues(policy.Name, "allowed").Inc()
 			next.ServeHTTP(w, r)
 		})
 	}

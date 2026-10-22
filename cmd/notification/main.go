@@ -17,12 +17,14 @@ import (
 
 	"github.com/elita001/order-microservices/internal/notification/adapter/customer"
 	notificationmessaging "github.com/elita001/order-microservices/internal/notification/adapter/messaging"
+	notificationmetrics "github.com/elita001/order-microservices/internal/notification/adapter/metrics"
 	notificationpostgres "github.com/elita001/order-microservices/internal/notification/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/notification/adapter/smtp"
 	"github.com/elita001/order-microservices/internal/notification/application"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/metrics"
 	"github.com/elita001/order-microservices/pkg/postgres"
 	"github.com/elita001/order-microservices/pkg/rabbitmq"
 )
@@ -70,7 +72,7 @@ func run() error {
 	defer pool.Close()
 
 	repo := notificationpostgres.NewRepository(pool)
-	svc := application.NewService(repo, customer.Stub{}, smtp.NewMailer(cfg.SMTP), log)
+	svc := application.NewService(repo, customer.Stub{}, smtp.NewMailer(cfg.SMTP), log).WithMetrics(notificationmetrics.Prometheus{})
 	eventHandler := notificationmessaging.NewHandler(svc)
 
 	consumer := rabbitmq.NewConsumer(cfg.RabbitMQURL, serviceName, rabbitmq.Topology{
@@ -82,7 +84,9 @@ func run() error {
 	// The notification service has no public API; HTTP serves health probes
 	// (and metrics in a later step).
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, httpx.Logger(log), httpx.Recoverer)
+	r.Use(middleware.RequestID, httpx.Logger(log), metrics.HTTP, httpx.Recoverer)
+	// Internal port: Prometheus scrapes it directly, clients never reach it.
+	r.Handle("/metrics", metrics.Handler())
 	httpx.RegisterHealth(r, pool.Ping)
 
 	srv := &http.Server{

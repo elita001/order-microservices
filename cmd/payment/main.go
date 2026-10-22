@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	paymentmessaging "github.com/elita001/order-microservices/internal/payment/adapter/messaging"
+	paymentmetrics "github.com/elita001/order-microservices/internal/payment/adapter/metrics"
 	paymentpostgres "github.com/elita001/order-microservices/internal/payment/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/payment/adapter/provider"
 	"github.com/elita001/order-microservices/internal/payment/application"
@@ -23,6 +24,7 @@ import (
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/metrics"
 	"github.com/elita001/order-microservices/pkg/outbox"
 	"github.com/elita001/order-microservices/pkg/postgres"
 	"github.com/elita001/order-microservices/pkg/rabbitmq"
@@ -77,7 +79,7 @@ func run() error {
 	relay := outbox.NewRelay(pool, paymentpostgres.OutboxTable, publisher, cfg.Outbox, log)
 
 	repo := paymentpostgres.NewRepository(pool)
-	svc := application.NewService(repo, provider.WithBreaker(provider.NewStub(cfg.Provider), cfg.Breaker, log), log)
+	svc := application.NewService(repo, provider.WithBreaker(provider.NewStub(cfg.Provider), cfg.Breaker, log), log).WithMetrics(paymentmetrics.Prometheus{})
 	eventHandler := paymentmessaging.NewHandler(svc)
 
 	consumer := rabbitmq.NewConsumer(cfg.RabbitMQURL, serviceName, rabbitmq.Topology{
@@ -89,7 +91,9 @@ func run() error {
 	// The payment service has no public API yet; HTTP serves health probes
 	// (and metrics in a later step).
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, httpx.Logger(log), httpx.Recoverer)
+	r.Use(middleware.RequestID, httpx.Logger(log), metrics.HTTP, httpx.Recoverer)
+	// Internal port: Prometheus scrapes it directly, clients never reach it.
+	r.Handle("/metrics", metrics.Handler())
 	httpx.RegisterHealth(r, pool.Ping)
 
 	srv := &http.Server{

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/caarlos0/env/v11"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/elita001/order-microservices/internal/gateway"
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
@@ -19,11 +20,14 @@ import (
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/metrics"
 	"github.com/elita001/order-microservices/pkg/redisclient"
 )
 
 type config struct {
-	HTTPAddr        string        `env:"HTTP_ADDR" envDefault:":8080"`
+	HTTPAddr string `env:"HTTP_ADDR" envDefault:":8080"`
+	// The gateway's main port is public, so metrics are served on a separate internal port.
+	MetricsAddr     string        `env:"METRICS_ADDR" envDefault:":9080"`
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
 
@@ -93,5 +97,16 @@ func run() error {
 		WriteTimeout: cfg.Upstream.Timeout + 5*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	return httpserver.Run(ctx, srv, cfg.ShutdownTimeout, log)
+	metricsSrv := &http.Server{
+		Addr:              cfg.MetricsAddr,
+		Handler:           metrics.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return httpserver.Run(gctx, srv, cfg.ShutdownTimeout, log) })
+	g.Go(func() error {
+		return httpserver.Run(gctx, metricsSrv, cfg.ShutdownTimeout, log.With("server", "metrics"))
+	})
+	return g.Wait()
 }

@@ -46,10 +46,16 @@ type Logger interface {
 	Info(message string, args ...any)
 }
 
+// Metrics records business metrics; a Prometheus adapter implements it.
+type Metrics interface {
+	ShipmentRegistered(carrier string)
+}
+
 type Service struct {
 	repo    Repository
 	carrier Carrier
 	logger  Logger
+	metrics Metrics
 	now     func() time.Time
 }
 
@@ -58,9 +64,20 @@ func NewService(repo Repository, carrier Carrier, logger Logger) *Service {
 		repo:    repo,
 		carrier: carrier,
 		logger:  logger,
+		metrics: noopMetrics{},
 		now:     func() time.Time { return time.Now().UTC() },
 	}
 }
+
+// WithMetrics enables business metrics; without it they are not recorded.
+func (s *Service) WithMetrics(m Metrics) *Service {
+	s.metrics = m
+	return s
+}
+
+type noopMetrics struct{}
+
+func (noopMetrics) ShipmentRegistered(string) {}
 
 type ShipOrderInput struct {
 	OrderID    uuid.UUID
@@ -118,6 +135,7 @@ func (s *Service) ShipOrder(ctx context.Context, in ShipOrderInput) error {
 		return nil
 	}
 
+	s.metrics.ShipmentRegistered(shipment.Carrier)
 	s.logger.Info("shipment registered",
 		"shipment_id", shipment.ID,
 		"order_id", shipment.OrderID,

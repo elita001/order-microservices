@@ -87,6 +87,7 @@ type Consumer struct {
 }
 
 func NewConsumer(url, name string, topology Topology, cfg ConsumerConfig, log *slog.Logger) *Consumer {
+	consumerPaused.WithLabelValues(topology.Queue).Set(0) // export 0, not "no data"
 	return &Consumer{
 		url:      url,
 		name:     name,
@@ -150,6 +151,9 @@ func (c *Consumer) waitHealthy(ctx context.Context) bool {
 	if c.healthCheck == nil || c.check(ctx) == nil {
 		return true
 	}
+	paused := consumerPaused.WithLabelValues(c.topology.Queue)
+	paused.Set(1)
+	defer paused.Set(0)
 	c.log.Warn("dependency unavailable, consumption is paused")
 	ticker := time.NewTicker(c.cfg.HealthInterval)
 	defer ticker.Stop()
@@ -343,6 +347,8 @@ func (c *Consumer) handle(session context.Context, fwd *forwarder, handler Handl
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(session), c.cfg.HandlerTimeout)
 	defer cancel()
 
+	queue := c.topology.Queue
+	start := time.Now()
 	err := safeCall(logger.WithContext(hctx, log), handler, Delivery{
 		MessageID:   d.MessageId,
 		RoutingKey:  routingKey,
@@ -350,29 +356,34 @@ func (c *Consumer) handle(session context.Context, fwd *forwarder, handler Handl
 		Redelivered: d.Redelivered,
 		Retry:       retry,
 	})
-	queue := c.topology.Queue
+	processingDuration.WithLabelValues(queue, routingKey).Observe(time.Since(start).Seconds())
+
+	var result string
 	switch {
 	case err == nil:
+		result = resultAck
 		if err := d.Ack(false); err != nil {
 			log.Error("ack message", "error", err)
 		}
 	case IsPermanent(err):
 		log.Error("message rejected, moving it to the dead letter queue", "error", err)
-		c.forward(session, fwd, d, DeadLetterQueue(queue), deadLetterHeaders(d, routingKey, queue, retry, err), log)
+		result = c.forward(session, fwd, d, DeadLetterQueue(queue), deadLetterHeaders(d, routingKey, queue, retry, err), resultDeadLetter, log)
 	case retry >= len(c.cfg.RetryDelays):
 		log.Error("retries exhausted, moving the message to the dead letter queue", "error", err)
-		c.forward(session, fwd, d, DeadLetterQueue(queue), deadLetterHeaders(d, routingKey, queue, retry, err), log)
+		result = c.forward(session, fwd, d, DeadLetterQueue(queue), deadLetterHeaders(d, routingKey, queue, retry, err), resultDeadLetter, log)
 	default:
 		delay := c.cfg.RetryDelays[retry]
 		log.Warn("message processing failed, will retry", "error", err, "retry_in", delay.String())
-		c.forward(session, fwd, d, RetryQueue(queue, delay), retryHeaders(d, routingKey, retry+1, err), log)
+		result = c.forward(session, fwd, d, RetryQueue(queue, delay), retryHeaders(d, routingKey, retry+1, err), resultRetry, log)
 	}
+	consumedMessages.WithLabelValues(queue, routingKey, result).Inc()
 }
 
 // forward publishes a copy of the message to a retry queue or the DLQ and then acks the
 // original. A crash in between leaves both, so the message is handled twice: acceptable,
 // because handlers are idempotent. Losing the message would not be.
-func (c *Consumer) forward(session context.Context, fwd *forwarder, d amqp.Delivery, queue string, headers amqp.Table, log *slog.Logger) {
+// It returns result on success and resultRequeue if the copy could not be published.
+func (c *Consumer) forward(session context.Context, fwd *forwarder, d amqp.Delivery, queue string, headers amqp.Table, result string, log *slog.Logger) string {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(session), forwardTimeout)
 	err := fwd.publish(ctx, queue, amqp.Publishing{
 		Headers:      headers,
@@ -392,11 +403,12 @@ func (c *Consumer) forward(session context.Context, fwd *forwarder, d amqp.Deliv
 		case <-time.After(c.cfg.RequeueDelay):
 		}
 		nack(log, d, true)
-		return
+		return resultRequeue
 	}
 	if err := d.Ack(false); err != nil {
 		log.Error("ack message", "error", err)
 	}
+	return result
 }
 
 // safeCall turns a handler panic into an error, so one bad message cannot crash the service.

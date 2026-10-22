@@ -18,11 +18,13 @@ import (
 	ordercache "github.com/elita001/order-microservices/internal/order/adapter/cache"
 	orderhttp "github.com/elita001/order-microservices/internal/order/adapter/http"
 	ordermessaging "github.com/elita001/order-microservices/internal/order/adapter/messaging"
+	ordermetrics "github.com/elita001/order-microservices/internal/order/adapter/metrics"
 	orderpostgres "github.com/elita001/order-microservices/internal/order/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/order/application"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/metrics"
 	"github.com/elita001/order-microservices/pkg/outbox"
 	"github.com/elita001/order-microservices/pkg/postgres"
 	"github.com/elita001/order-microservices/pkg/rabbitmq"
@@ -92,7 +94,7 @@ func run() error {
 
 	// Cache-aside decorator: the application service does not know about the cache.
 	repo := ordercache.New(orderpostgres.NewRepository(pool), rdb, cfg.Cache, cfg.Redis.OperationTimeout, log)
-	svc := application.NewService(repo, log)
+	svc := application.NewService(repo, log).WithMetrics(ordermetrics.Prometheus{})
 	httpHandler := orderhttp.NewHandler(svc)
 	eventHandler := ordermessaging.NewHandler(svc)
 
@@ -103,7 +105,9 @@ func run() error {
 	}, cfg.Consumer, log).WithHealthCheck(pool.Ping)
 
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, httpx.Logger(log), httpx.Recoverer)
+	r.Use(middleware.RequestID, httpx.Logger(log), metrics.HTTP, httpx.Recoverer)
+	// Internal port: Prometheus scrapes it directly, clients never reach it.
+	r.Handle("/metrics", metrics.Handler())
 	httpx.RegisterHealth(r, pool.Ping)
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(httpx.Timeout(cfg.RequestTimeout))

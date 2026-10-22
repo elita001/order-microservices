@@ -11,8 +11,15 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/sony/gobreaker/v2"
 )
+
+var state = promauto.NewGaugeVec(prometheus.GaugeOpts{
+	Name: "circuit_breaker_state",
+	Help: "Circuit breaker state: 0 closed, 1 half-open, 2 open.",
+}, []string{"name"})
 
 // ErrOpen is returned without calling the dependency while the breaker is open.
 var ErrOpen = errors.New("circuit breaker is open")
@@ -32,6 +39,7 @@ type Breaker[T any] struct {
 // nil counts every error. Canceled calls (the caller gave up) are never counted.
 func New[T any](name string, cfg Config, isFailure func(error) bool, log *slog.Logger) *Breaker[T] {
 	log = log.With("component", "circuit_breaker", "breaker", name)
+	state.WithLabelValues(name).Set(float64(gobreaker.StateClosed))
 	return &Breaker[T]{cb: gobreaker.NewCircuitBreaker[T](gobreaker.Settings{
 		Name:        name,
 		MaxRequests: cfg.HalfOpenRequests,
@@ -47,6 +55,7 @@ func New[T any](name string, cfg Config, isFailure func(error) bool, log *slog.L
 		},
 		// State changes are logged once instead of an error on every rejected call.
 		OnStateChange: func(_ string, from, to gobreaker.State) {
+			state.WithLabelValues(name).Set(float64(to))
 			if to == gobreaker.StateOpen {
 				log.Error("circuit breaker opened: dependency calls are suspended", "from", from.String(), "open_for", cfg.OpenTimeout.String())
 				return

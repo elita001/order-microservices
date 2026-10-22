@@ -33,8 +33,12 @@ type RelayConfig struct {
 // Several replicas can run concurrently: each batch is locked with FOR UPDATE SKIP LOCKED.
 // A message is marked as published only after the broker confirms it; if the process
 // crashes in between, the message is sent again (at-least-once).
+// backlogInterval is how often the backlog metrics are refreshed.
+const backlogInterval = 10 * time.Second
+
 type Relay struct {
 	pool      *pgxpool.Pool
+	tableName string
 	table     string // sanitized identifier, safe to put into queries
 	publisher Publisher
 	cfg       RelayConfig
@@ -42,8 +46,12 @@ type Relay struct {
 }
 
 func NewRelay(pool *pgxpool.Pool, table string, publisher Publisher, cfg RelayConfig, log *slog.Logger) *Relay {
+	// Export zeros from the start, so dashboards and alerts show 0 instead of "no data".
+	publishedMessages.WithLabelValues(table).Add(0)
+	publishErrors.WithLabelValues(table).Add(0)
 	return &Relay{
 		pool:      pool,
+		tableName: table,
 		table:     pgx.Identifier{table}.Sanitize(),
 		publisher: publisher,
 		cfg:       cfg,
@@ -57,7 +65,7 @@ func (r *Relay) Run(ctx context.Context) error {
 	r.log.Info("outbox relay started", "batch_size", r.cfg.BatchSize, "poll_interval", r.cfg.PollInterval.String())
 
 	delay := r.cfg.PollInterval
-	var lastCleanup time.Time
+	var lastCleanup, lastBacklog time.Time
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
@@ -76,6 +84,10 @@ func (r *Relay) Run(ctx context.Context) error {
 			delay = r.cfg.PollInterval
 		}
 
+		if time.Since(lastBacklog) >= backlogInterval {
+			r.observeBacklog(ctx)
+			lastBacklog = time.Now()
+		}
 		if time.Since(lastCleanup) >= r.cfg.CleanupInterval {
 			r.cleanup(ctx)
 			lastCleanup = time.Now()
@@ -142,6 +154,7 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 			// Stop at the first failure: the broker is most likely unavailable,
 			// and continuing would also break the order of events.
 			publishErr = fmt.Errorf("publish message %s (%s): %w", msg.ID, msg.EventType, err)
+			publishErrors.WithLabelValues(r.tableName).Inc()
 			if _, err := tx.Exec(ctx, fmt.Sprintf(`
 				UPDATE %s SET attempts = attempts + 1, last_error = $2 WHERE id = $1`, r.table),
 				msg.ID, publishErr.Error()); err != nil {
@@ -161,6 +174,7 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 		return 0, errors.Join(publishErr, fmt.Errorf("commit: %w", err))
 	}
 	if len(published) > 0 {
+		publishedMessages.WithLabelValues(r.tableName).Add(float64(len(published)))
 		r.log.Debug("outbox messages published", "count", len(published))
 	}
 	return len(published), publishErr
@@ -189,4 +203,22 @@ func (r *Relay) cleanup(ctx context.Context) {
 	if total > 0 {
 		r.log.Info("outbox cleanup finished", "deleted", total)
 	}
+}
+
+// observeBacklog updates the backlog metrics. The partial index on unpublished messages
+// keeps the query cheap.
+func (r *Relay) observeBacklog(ctx context.Context) {
+	var (
+		pending int64
+		age     float64
+	)
+	err := r.pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT count(*), COALESCE(EXTRACT(EPOCH FROM now() - min(created_at)), 0)::float8
+		FROM %s WHERE published_at IS NULL`, r.table)).Scan(&pending, &age)
+	if err != nil {
+		r.log.Warn("observe outbox backlog", "error", err)
+		return
+	}
+	pendingMessages.WithLabelValues(r.tableName).Set(float64(pending))
+	oldestPendingAge.WithLabelValues(r.tableName).Set(age)
 }

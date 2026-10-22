@@ -49,10 +49,16 @@ type Logger interface {
 	Info(message string, args ...any)
 }
 
+// Metrics records business metrics; a Prometheus adapter implements it.
+type Metrics interface {
+	PaymentCompleted(status domain.Status, reason, currency string, amount int64)
+}
+
 type Service struct {
 	repo     Repository
 	provider Provider
 	logger   Logger
+	metrics  Metrics
 	now      func() time.Time
 }
 
@@ -61,9 +67,20 @@ func NewService(repo Repository, provider Provider, logger Logger) *Service {
 		repo:     repo,
 		provider: provider,
 		logger:   logger,
+		metrics:  noopMetrics{},
 		now:      func() time.Time { return time.Now().UTC() },
 	}
 }
+
+// WithMetrics enables business metrics; without it they are not recorded.
+func (s *Service) WithMetrics(m Metrics) *Service {
+	s.metrics = m
+	return s
+}
+
+type noopMetrics struct{}
+
+func (noopMetrics) PaymentCompleted(domain.Status, string, string, int64) {}
 
 type ProcessPaymentInput struct {
 	OrderID    uuid.UUID
@@ -129,6 +146,7 @@ func (s *Service) ProcessPayment(ctx context.Context, in ProcessPaymentInput) er
 		return nil
 	}
 
+	s.metrics.PaymentCompleted(payment.Status, payment.FailureReason, payment.Currency, payment.Amount)
 	s.logger.Info("payment processed",
 		"payment_id", payment.ID,
 		"order_id", payment.OrderID,

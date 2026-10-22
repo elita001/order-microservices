@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: OrderFlow
+    folder: OrderFlow
+    type: file
+    # Dashboards are code: edit the JSON in deploy/grafana/dashboards and restart Grafana
+    # (changes made in the UI are not saved back to the repository).
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

@@ -130,21 +130,26 @@ func (r *Repository) get(ctx context.Context, id uuid.UUID) (*domain.Order, bool
 
 	raw, err := r.rdb.Get(ctx, keyPrefix+id.String()).Result()
 	if err == redis.Nil {
+		requests.WithLabelValues("miss").Inc()
 		return nil, false
 	}
 	if err != nil {
+		requests.WithLabelValues("unavailable").Inc()
 		r.warn(ctx, "read order from cache", err)
 		return nil, false
 	}
 	_, payload, _ := strings.Cut(raw, "|")
 	if payload == "" { // tombstone: recently invalidated
+		requests.WithLabelValues("miss").Inc()
 		return nil, false
 	}
 	var cached cachedOrder
 	if err := json.Unmarshal([]byte(payload), &cached); err != nil {
+		requests.WithLabelValues("miss").Inc()
 		r.warn(ctx, "decode cached order", err)
 		return nil, false
 	}
+	requests.WithLabelValues("hit").Inc()
 	logger.FromContext(ctx).Debug("order cache hit", "order_id", id)
 	return cached.toDomain(), true
 }

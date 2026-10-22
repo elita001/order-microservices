@@ -94,6 +94,7 @@ func (s *Store) Middleware(next http.Handler) http.Handler {
 		acquired, err := s.rdb.SetNX(ctx, redisKey, lock, s.cfg.LockTTL).Result()
 		cancel()
 		if err != nil {
+			requests.WithLabelValues(resultBypassed).Inc()
 			warnUnavailable(log, err)
 			next.ServeHTTP(w, r)
 			return
@@ -103,6 +104,7 @@ func (s *Store) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		requests.WithLabelValues(resultFirst).Inc()
 		rec := newRecorder()
 		next.ServeHTTP(rec, r)
 		s.save(r.Context(), redisKey, fingerprint, rec)
@@ -117,6 +119,7 @@ func (s *Store) handleRepeat(w http.ResponseWriter, r *http.Request, next http.H
 	cancel()
 	if err != nil {
 		// The entry expired in between, or Redis failed: the upstream service deduplicates.
+		requests.WithLabelValues(resultBypassed).Inc()
 		if !errors.Is(err, redis.Nil) {
 			warnUnavailable(log, err)
 		}
@@ -132,13 +135,16 @@ func (s *Store) handleRepeat(w http.ResponseWriter, r *http.Request, next http.H
 
 	switch {
 	case rec.Fingerprint != fingerprint:
+		requests.WithLabelValues(resultKeyReused).Inc()
 		httpx.WriteError(w, http.StatusUnprocessableEntity, "idempotency_key_reused",
 			"Idempotency-Key was already used for a different request")
 	case rec.State == stateProcessing:
+		requests.WithLabelValues(resultInProgress).Inc()
 		w.Header().Set("Retry-After", "1")
 		httpx.WriteError(w, http.StatusConflict, "request_in_progress",
 			"a request with this Idempotency-Key is still in progress")
 	default:
+		requests.WithLabelValues(resultReplayed).Inc()
 		for name, value := range rec.Header {
 			w.Header().Set(name, value)
 		}

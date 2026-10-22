@@ -45,19 +45,38 @@ type Logger interface {
 	Info(message string, args ...any)
 }
 
+// Metrics records business metrics; a Prometheus adapter implements it.
+type Metrics interface {
+	OrderCreated(currency string)
+	OrderStatusChanged(status domain.Status)
+}
+
 type Service struct {
-	repo   Repository
-	logger Logger
-	now    func() time.Time
+	repo    Repository
+	logger  Logger
+	metrics Metrics
+	now     func() time.Time
 }
 
 func NewService(repo Repository, logger Logger) *Service {
 	return &Service{
-		repo:   repo,
-		logger: logger,
-		now:    func() time.Time { return time.Now().UTC() },
+		repo:    repo,
+		logger:  logger,
+		metrics: noopMetrics{},
+		now:     func() time.Time { return time.Now().UTC() },
 	}
 }
+
+// WithMetrics enables business metrics; without it they are not recorded.
+func (s *Service) WithMetrics(m Metrics) *Service {
+	s.metrics = m
+	return s
+}
+
+type noopMetrics struct{}
+
+func (noopMetrics) OrderCreated(string)              {}
+func (noopMetrics) OrderStatusChanged(domain.Status) {}
 
 type CreateOrderInput struct {
 	CustomerID     uuid.UUID
@@ -139,6 +158,7 @@ func (s *Service) Create(ctx context.Context, in CreateOrderInput) (*CreateOrder
 		return nil, fmt.Errorf("create order: %w", err)
 	}
 
+	s.metrics.OrderCreated(order.Currency)
 	s.logger.Info("order created",
 		"order_id", order.ID,
 		"customer_id", order.CustomerID,
@@ -236,6 +256,7 @@ func (s *Service) changeStatus(ctx context.Context, orderID uuid.UUID, from []do
 		return nil
 	}
 
+	s.metrics.OrderStatusChanged(to)
 	s.logger.Info("order status changed",
 		"order_id", orderID,
 		"status", to,

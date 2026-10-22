@@ -1,0 +1,37 @@
+# Scrape configuration for local development (docker compose).
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # The job name is the service name: dashboards and alerts group by it.
+  - job_name: gateway
+    static_configs:
+      - targets: ["gateway:9080"] # separate internal port, the main one is public
+  - job_name: order
+    static_configs:
+      - targets: ["order:8081"]
+  - job_name: payment
+    static_configs:
+      - targets: ["payment:8082"]
+  - job_name: delivery
+    static_configs:
+      - targets: ["delivery:8083"]
+  - job_name: notification
+    static_configs:
+      - targets: ["notification:8084"]
+
+  # RabbitMQ's built-in exporter (rabbitmq_prometheus plugin): node-level metrics...
+  - job_name: rabbitmq
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+  # ...and per-queue depth, needed for queue and DLQ panels and the DLQ alert.
+  - job_name: rabbitmq-queues
+    metrics_path: /metrics/detailed
+    params:
+      family: [queue_coarse_metrics]
+    static_configs:
+      - targets: ["rabbitmq:15692"]

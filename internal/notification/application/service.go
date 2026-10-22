@@ -50,11 +50,17 @@ type Logger interface {
 	Info(message string, args ...any)
 }
 
+// Metrics records business metrics; a Prometheus adapter implements it.
+type Metrics interface {
+	NotificationSent(kind domain.Kind)
+}
+
 type Service struct {
 	repo      Repository
 	customers CustomerDirectory
 	mailer    Mailer
 	logger    Logger
+	metrics   Metrics
 	now       func() time.Time
 }
 
@@ -64,9 +70,20 @@ func NewService(repo Repository, customers CustomerDirectory, mailer Mailer, log
 		customers: customers,
 		mailer:    mailer,
 		logger:    logger,
+		metrics:   noopMetrics{},
 		now:       func() time.Time { return time.Now().UTC() },
 	}
 }
+
+// WithMetrics enables business metrics; without it they are not recorded.
+func (s *Service) WithMetrics(m Metrics) *Service {
+	s.metrics = m
+	return s
+}
+
+type noopMetrics struct{}
+
+func (noopMetrics) NotificationSent(domain.Kind) {}
 
 type Item struct {
 	ProductID string
@@ -175,6 +192,7 @@ func (s *Service) notify(ctx context.Context, kind domain.Kind, orderID, custome
 		return nil
 	}
 
+	s.metrics.NotificationSent(kind)
 	// The email address is personal data, so only the customer ID goes to the logs.
 	s.logger.Info("notification sent", "kind", kind, "order_id", orderID, "customer_id", customerID)
 	return nil

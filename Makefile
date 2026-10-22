@@ -3,7 +3,7 @@
 RABBITMQ_URL ?= amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@localhost:$(or $(RABBITMQ_PORT),5672)/
 SERVICE_QUEUES = order-service payment-service delivery-service notification-service
 
-.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues
+.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards
 
 up: .env      ## build and start everything
 	docker compose up -d --build --remove-orphans
@@ -56,3 +56,7 @@ dlq-replay:    ## move dead-lettered messages back for processing: make dlq-repl
 rabbitmq-reset-queues: ## DEVELOPMENT ONLY: delete the service queues (and their messages), e.g. after queue arguments changed
 	for q in $(SERVICE_QUEUES); do docker compose exec rabbitmq rabbitmqctl delete_queue $$q; done
 	docker compose restart order payment delivery notification
+
+dashboards:    ## regenerate Grafana dashboards from deploy/grafana/dashboards.py
+	python3 deploy/grafana/dashboards.py
+	docker compose restart grafana
