@@ -98,6 +98,7 @@ services:
   # Fake SMTP server: catches all emails and shows them in a web UI.
   mailpit:
     image: axllent/mailpit:v1.27
+    user: "65534:65534" # nobody: the image would run as root, and Mailpit needs no privileges
     ports:
       - "${MAILPIT_UI_PORT:-8025}:8025"
     healthcheck:
@@ -340,8 +341,13 @@ services:
       - tempodata:/var/tempo
     restart: unless-stopped
 
+  # Alloy never touches the Docker socket: access to it equals root on the host, even when
+  # mounted read-only (":ro" protects the socket file, not the API, which can start a
+  # privileged container). It runs as the unprivileged "alloy" user and reads container
+  # lists and logs through docker-socket-proxy.
   alloy:
     image: grafana/alloy:v1.10.2
+    user: "473:473" # the image's "alloy" user; the image would run as root by default
     command:
       - run
       - --server.http.listen-addr=0.0.0.0:12345
@@ -351,13 +357,29 @@ services:
       COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME} # collect logs of this project only
     volumes:
       - ./deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro
-      # Read-only access to the Docker API to discover containers and read their logs.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloydata:/var/lib/alloy/data # read positions in the logs survive restarts
+    networks: [default, docker-api]
     ports:
       - "${ALLOY_UI_PORT:-12345}:12345"
     depends_on:
       - loki
       - tempo
+      - docker-socket-proxy
+    restart: unless-stopped
+
+  # The only container with the Docker socket. It allows a minimal read-only part of the
+  # API (listing containers and networks, reading logs) and rejects everything else,
+  # including any POST. It is reachable only from the internal docker-api network: container
+  # details include environment variables with passwords.
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:v0.4.1
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [docker-api]
     restart: unless-stopped
 
   # Error tracking: GlitchTip is a lightweight, Sentry-compatible server (the services use
@@ -405,7 +427,14 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+networks:
+  default:
+  # Only Alloy and the Docker API proxy are attached; "internal" means no outside access.
+  docker-api:
+    internal: true
+
 volumes:
+  alloydata:
   pgdata:
   rabbitmqdata:
   promdata:

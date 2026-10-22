@@ -115,9 +115,13 @@ Amounts are stored in the currency's smallest units (kopecks): `59900` = RUB 599
 The gateway is the single entry point for clients. It contains no business logic and
 applies the edge concerns to every request:
 
-- **Request ID.** The client's `X-Request-Id` is kept if it is short and safe to log,
-  otherwise a new one is generated. It is returned in the response and forwarded to the
-  services, so the logs of the gateway and of Order Service share one `request_id`.
+- **Request ID.** The gateway always generates its own `X-Request-Id` (a UUID), returns it
+  in the response (a client quotes it to support), and forwards it to the services. A
+  client-supplied ID could collide with another client's or be chosen to mix into someone
+  else's logs, so it is only logged as `client_request_id` next to ours.
+- **Tracing at the edge.** The gateway starts a new trace for every request: a
+  `traceparent` from the internet is only linked, never continued. Otherwise a client could
+  attach requests to someone else's trace or force its traces to be sampled.
 - **Rate limiting** per client IP in Redis (GCRA, exact across gateway replicas):
   `RATE_LIMIT_WRITE_*` for `POST`, `RATE_LIMIT_READ_*` for `GET`. Over the limit the
   client gets `429` with `Retry-After`.
@@ -344,8 +348,8 @@ Delivering alerts to Slack or email needs Alertmanager, which is not part of the
 One business flow (an order from `POST /orders` to the "shipped" email) crosses five
 services and three message hops. Three things tie it together:
 
-- **Request ID.** The gateway accepts or generates `X-Request-Id`; every service puts it
-  into its logs (`request_id`).
+- **Request ID.** The gateway generates `X-Request-Id` and returns it to the client; every
+  service puts it into its logs (`request_id`).
 - **Trace context.** OpenTelemetry spans for HTTP, SQL (pgx), Redis, message publishing and
   processing, and external calls (payment provider, carrier, SMTP) form one trace.
 - **Propagation across the async boundary.** When an event is stored in the outbox, the
@@ -358,7 +362,10 @@ gateway ──HTTP traceparent──▶ order ──outbox headers──▶ rela
 ```
 
 **Logs.** Services write JSON logs (`log/slog`) to stdout. Grafana Alloy reads them from
-Docker and sends them to Loki. `service` and `level` are labels; `request_id` and `trace_id`
+Docker and sends them to Loki. Alloy runs as an unprivileged user and has no access to the
+Docker socket, which equals root on the host even when mounted read-only: it reads container
+lists and logs through `docker-socket-proxy`, which allows only those read-only API calls
+and is reachable only from an internal network. `service` and `level` are labels; `request_id` and `trace_id`
 are structured metadata: they are unique per request, and as labels they would create a
 stream per request. Every record written with a context (`InfoContext`) gets `request_id`,
 `trace_id`, and `span_id` automatically.
@@ -387,12 +394,12 @@ set up by hand. Set `SENTRY_DSN` to send errors to sentry.io instead.
 Try it:
 
 ```bash
-curl -s -X POST localhost:8080/api/v1/orders -H 'Content-Type: application/json' \
-  -H 'X-Request-Id: demo-1' \
-  -d '{"customer_id":"7b0c8a3e-2f1d-4e5a-9b6c-1d2e3f4a5b6c","currency":"RUB","items":[{"product_id":"book-42","quantity":1,"price":59900}]}'
+curl -s -i -X POST localhost:8080/api/v1/orders -H 'Content-Type: application/json' \
+  -d '{"customer_id":"7b0c8a3e-2f1d-4e5a-9b6c-1d2e3f4a5b6c","currency":"RUB","items":[{"product_id":"book-42","quantity":1,"price":59900}]}' \
+  | grep -i x-request-id
 ```
 
-Then open the Logs dashboard with Request ID `demo-1`, and the `trace_id` link of any record.
+Then open the Logs dashboard with that request ID, and the `trace_id` link of any record.
 
 ### External service stubs
 

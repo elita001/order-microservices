@@ -225,15 +225,17 @@ func TestProxy_UpstreamUnavailable(t *testing.T) {
 	}
 }
 
-func TestRequestIDIsForwarded(t *testing.T) {
+// The gateway generates the request ID itself and forwards it; a client's ID is never used.
+func TestRequestIDIsGeneratedAndForwarded(t *testing.T) {
 	env := newTestEnv(t, generousLimit)
 
 	resp, _ := env.post(t, "", `{}`, map[string]string{httpx.RequestIDHeader: "trace-42"})
-	if got := env.lastReqID.Load(); got != "trace-42" {
-		t.Errorf("upstream got request ID %v, want trace-42", got)
+	generated := resp.Header.Get(httpx.RequestIDHeader)
+	if generated == "" || generated == "trace-42" {
+		t.Fatalf("response request ID = %q, want a generated one", generated)
 	}
-	if got := resp.Header.Get(httpx.RequestIDHeader); got != "trace-42" {
-		t.Errorf("response request ID = %q, want trace-42", got)
+	if got := env.lastReqID.Load(); got != generated {
+		t.Errorf("upstream got request ID %v, want the generated %s", got, generated)
 	}
 }
 

@@ -72,6 +72,9 @@ func withScope(ctx context.Context, tags map[string]string, capture func(hub *se
 		if id := requestid.FromContext(ctx); id != "" {
 			scope.SetTag("request_id", id)
 		}
+		if id := requestid.ClientIDFromContext(ctx); id != "" {
+			scope.SetTag("client_request_id", id)
+		}
 		if id := telemetry.TraceID(ctx); id != "" {
 			scope.SetTag("trace_id", id)
 		}

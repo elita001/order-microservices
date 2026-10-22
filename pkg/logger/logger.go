@@ -37,6 +37,9 @@ func correlation(ctx context.Context) []any {
 	if id := requestid.FromContext(ctx); id != "" {
 		attrs = append(attrs, "request_id", id)
 	}
+	if id := requestid.ClientIDFromContext(ctx); id != "" {
+		attrs = append(attrs, "client_request_id", id)
+	}
 	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
 		attrs = append(attrs, "trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String())
 	}

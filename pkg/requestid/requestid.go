@@ -13,13 +13,30 @@ import (
 // MessageHeader carries the request ID in outbox and AMQP message headers.
 const MessageHeader = "x-request-id"
 
-type ctxKey struct{}
+type (
+	ctxKey       struct{}
+	clientCtxKey struct{}
+)
 
 func WithContext(ctx context.Context, id string) context.Context {
 	if id == "" {
 		return ctx
 	}
 	return context.WithValue(ctx, ctxKey{}, id)
+}
+
+// WithClientID stores the request ID a client sent. It is only logged next to ours, so
+// clients can correlate their own logs; it is never used as our request ID.
+func WithClientID(ctx context.Context, id string) context.Context {
+	if id == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, clientCtxKey{}, id)
+}
+
+func ClientIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(clientCtxKey{}).(string)
+	return id
 }
 
 // FromContext returns the request ID set by WithContext or by chi's RequestID middleware.

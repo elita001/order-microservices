@@ -68,13 +68,24 @@ func Tracer(name string) trace.Tracer {
 // HTTPHandler starts a server span for every request, continuing the caller's trace if
 // the request has a traceparent header. Probes and metrics scrapes are not traced.
 func HTTPHandler(h http.Handler) http.Handler {
-	return otelhttp.NewHandler(h, "http.server", otelhttp.WithFilter(func(r *http.Request) bool {
-		switch r.URL.Path {
-		case "/metrics", "/healthz", "/readyz":
-			return false
-		}
-		return true
-	}))
+	return otelhttp.NewHandler(h, "http.server", otelhttp.WithFilter(traced))
+}
+
+// PublicHTTPHandler is HTTPHandler for the edge of the system (the gateway). It always
+// starts a new trace: a traceparent from the internet is only linked to the server span,
+// never its parent. Otherwise a client could attach requests to someone else's trace or
+// set the "sampled" flag to force every one of its traces to be stored.
+func PublicHTTPHandler(h http.Handler) http.Handler {
+	return otelhttp.NewHandler(h, "http.server", otelhttp.WithFilter(traced),
+		otelhttp.WithPublicEndpointFn(func(*http.Request) bool { return true }))
+}
+
+func traced(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/metrics", "/healthz", "/readyz":
+		return false
+	}
+	return true
 }
 
 // HTTPTransport traces outgoing requests and adds the traceparent header to them.

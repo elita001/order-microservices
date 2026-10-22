@@ -113,7 +113,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           telemetry.HTTPHandler(router),
+		Handler:           telemetry.PublicHTTPHandler(router), // the public entry point
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		// Longer than the upstream timeout, so the gateway can still send its 504.
