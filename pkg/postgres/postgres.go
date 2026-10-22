@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -24,6 +25,9 @@ func Connect(ctx context.Context, dsn string, log *slog.Logger) (*pgxpool.Pool, 
 	if cfg.ConnConfig.ConnectTimeout == 0 {
 		cfg.ConnConfig.ConnectTimeout = 3 * time.Second
 	}
+
+	// Every query becomes a span of the current trace.
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTrimSQLInSpanName())
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

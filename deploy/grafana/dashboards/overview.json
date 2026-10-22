@@ -39,6 +39,12 @@
       "type": "link",
       "url": "/d/orderflow-messaging",
       "icon": "dashboard"
+    },
+    {
+      "title": "Logs",
+      "type": "link",
+      "url": "/d/orderflow-logs",
+      "icon": "dashboard"
     }
   ],
   "panels": [

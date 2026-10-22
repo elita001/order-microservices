@@ -46,8 +46,9 @@ var ErrInvalidRecipient = errors.New("invalid recipient")
 var ErrOutOfOrder = errors.New("event arrived before the event it follows")
 
 // Logger is the logging capability required by the application service.
+// It is called with the request context, so the records carry request_id and trace_id.
 type Logger interface {
-	Info(message string, args ...any)
+	InfoContext(ctx context.Context, message string, args ...any)
 }
 
 // Metrics records business metrics; a Prometheus adapter implements it.
@@ -188,13 +189,13 @@ func (s *Service) notify(ctx context.Context, kind domain.Kind, orderID, custome
 		return fmt.Errorf("send %s notification for order %s: %w", kind, orderID, err)
 	}
 	if !sent {
-		s.logger.Info("notification already sent, skipping", "kind", kind, "order_id", orderID)
+		s.logger.InfoContext(ctx, "notification already sent, skipping", "kind", kind, "order_id", orderID)
 		return nil
 	}
 
 	s.metrics.NotificationSent(kind)
 	// The email address is personal data, so only the customer ID goes to the logs.
-	s.logger.Info("notification sent", "kind", kind, "order_id", orderID, "customer_id", customerID)
+	s.logger.InfoContext(ctx, "notification sent", "kind", kind, "order_id", orderID, "customer_id", customerID)
 	return nil
 }
 

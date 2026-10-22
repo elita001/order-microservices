@@ -14,6 +14,7 @@ import (
 
 	"github.com/elita001/order-microservices/internal/order/application"
 	"github.com/elita001/order-microservices/internal/order/domain"
+	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
 	"github.com/elita001/order-microservices/pkg/postgres"
@@ -173,6 +174,7 @@ func (h *Handler) handleError(w http.ResponseWriter, r *http.Request, err error)
 		httpx.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "service is temporarily unavailable, retry later")
 	default:
 		logger.FromContext(r.Context()).Error("request failed", "error", err)
+		errtrack.CaptureError(r.Context(), err, nil) // unexpected: needs a human
 		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 	}
 }

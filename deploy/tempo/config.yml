@@ -1,0 +1,46 @@
+# Single-process Tempo with local storage, for development.
+# Grafana queries Tempo with streaming over HTTP (search, health check).
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+  log_level: warn
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal
+
+compactor:
+  compaction:
+    block_retention: 168h
+
+# Builds the service graph (who calls whom, how often, how slow) from the spans and writes
+# it to Prometheus; Grafana shows it as the service map of the Tempo data source.
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+  processor:
+    service_graphs:
+      # Messaging edges (producer -> consumer) arrive much later than HTTP ones.
+      wait: 30s
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [service-graphs]

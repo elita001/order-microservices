@@ -66,6 +66,8 @@ Management UIs:
 - Mailpit (all emails sent by the system): http://localhost:8025
 - Grafana (dashboards, no login needed to view; admin / `GRAFANA_ADMIN_PASSWORD`): http://localhost:3000
 - Prometheus (metrics, alerts): http://localhost:9090
+- GlitchTip (errors; `GLITCHTIP_ADMIN_EMAIL` / `GLITCHTIP_ADMIN_PASSWORD` from `.env`): http://localhost:8000
+- Alloy (telemetry pipeline graph): http://localhost:12345
 
 Useful commands:
 
@@ -337,6 +339,61 @@ after a service starts) are not undercounted.
 
 Delivering alerts to Slack or email needs Alertmanager, which is not part of the local setup.
 
+## Logs, traces, and errors
+
+One business flow (an order from `POST /orders` to the "shipped" email) crosses five
+services and three message hops. Three things tie it together:
+
+- **Request ID.** The gateway accepts or generates `X-Request-Id`; every service puts it
+  into its logs (`request_id`).
+- **Trace context.** OpenTelemetry spans for HTTP, SQL (pgx), Redis, message publishing and
+  processing, and external calls (payment provider, carrier, SMTP) form one trace.
+- **Propagation across the async boundary.** When an event is stored in the outbox, the
+  current `traceparent` and request ID are saved in the `headers` column. The relay
+  publishes them as AMQP headers, and the consumer continues the same trace and request ID,
+  so the events it produces carry them on to the next service.
+
+```
+gateway ──HTTP traceparent──▶ order ──outbox headers──▶ relay ──AMQP headers──▶ payment ──▶ ...
+```
+
+**Logs.** Services write JSON logs (`log/slog`) to stdout. Grafana Alloy reads them from
+Docker and sends them to Loki. `service` and `level` are labels; `request_id` and `trace_id`
+are structured metadata: they are unique per request, and as labels they would create a
+stream per request. Every record written with a context (`InfoContext`) gets `request_id`,
+`trace_id`, and `span_id` automatically.
+
+```logql
+{service=~".+"} | request_id="<id>"
+```
+
+The **Logs** dashboard has a "Request ID" filter that shows one order's whole flow; a
+`trace_id` in a record links to its trace.
+
+**Traces.** Services export spans over OTLP to Alloy, which forwards them to Tempo. In
+Grafana (Explore → Tempo) a trace shows the whole order: e.g., ~1s between the order commit
+and `order.created publish` is the outbox polling interval, and `payment_provider.charge`
+shows how long the provider took. Each span links to its logs, and Tempo builds the
+**service map** (Explore → Tempo → Service Graph) from the spans.
+
+**Errors.** Panics, unexpected 500s, and messages moved to a dead letter queue are reported
+with the official `sentry-go` SDK to GlitchTip, a lightweight Sentry-compatible server.
+Each report is tagged with `request_id`, `trace_id`, and, for messages, the queue, event,
+and `message_id`. Expected conditions (validation errors, an unavailable database, retried
+messages) are not reported: metrics and alerts cover them. On first start, `glitchtip-init`
+creates the admin user and the project with the DSN key from `.env`, so nothing has to be
+set up by hand. Set `SENTRY_DSN` to send errors to sentry.io instead.
+
+Try it:
+
+```bash
+curl -s -X POST localhost:8080/api/v1/orders -H 'Content-Type: application/json' \
+  -H 'X-Request-Id: demo-1' \
+  -d '{"customer_id":"7b0c8a3e-2f1d-4e5a-9b6c-1d2e3f4a5b6c","currency":"RUB","items":[{"product_id":"book-42","quantity":1,"price":59900}]}'
+```
+
+Then open the Logs dashboard with Request ID `demo-1`, and the `trace_id` link of any record.
+
 ### External service stubs
 
 | Stub | Behavior |
@@ -350,6 +407,15 @@ Like real providers, the payment and carrier stubs are idempotent: the outcome (
 tracking number) is derived from the idempotency key, so a retry gets the same result.
 
 ## Configuration
+
+Telemetry (all Go services):
+
+| Variable                       | Default | Description                                         |
+|--------------------------------|---------|-----------------------------------------------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`  | — (tracing off) | OTLP/HTTP collector, `http://alloy:4318`    |
+| `OTEL_TRACES_SAMPLER_RATIO`    | `1`     | share of traces kept (the caller's decision wins)   |
+| `SENTRY_DSN`                   | — (reporting off) | GlitchTip or Sentry DSN                   |
+| `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE` | `development`, — | tags of error reports              |
 
 API gateway:
 
@@ -449,7 +515,12 @@ cmd/dlq/                                 tool to inspect and replay dead letter 
 internal/<service>/adapter/metrics/      business metrics (Prometheus adapter of the Metrics port)
 pkg/metrics/                             /metrics handler and HTTP RED middleware
 deploy/prometheus/                       scrape configuration and alert rules
-deploy/grafana/                          data source, dashboards, and their generator
+deploy/grafana/                          data sources, dashboards, and their generator
+deploy/loki/, deploy/tempo/              log and trace storage configuration
+deploy/alloy/                            telemetry agent: container logs to Loki, OTLP traces to Tempo
+deploy/glitchtip/                        bootstrap of the error tracker (admin, project, DSN key)
+pkg/telemetry/                           OpenTelemetry setup and trace context propagation
+pkg/requestid/, pkg/errtrack/            request ID in context, error reporting
 internal/order/adapter/cache/            cache-aside decorator of the order repository
 migrations/<service>/                    SQL migrations per service (golang-migrate)
 ```

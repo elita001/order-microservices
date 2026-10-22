@@ -8,16 +8,17 @@ import (
 
 	"github.com/go-chi/chi/v5/middleware"
 
+	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/logger"
 )
 
-// Logger logs each request and stores a logger with request_id in the context.
-// It must be placed after middleware.RequestID.
+// Logger logs each request and stores a logger with request_id and trace_id in the context.
+// It must be placed after the request ID middleware and inside the tracing handler.
 func Logger(base *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
-			l := base.With("request_id", middleware.GetReqID(r.Context()))
+			l := logger.WithCorrelation(r.Context(), base)
 			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 
 			next.ServeHTTP(ww, r.WithContext(logger.WithContext(r.Context(), l)))
@@ -50,6 +51,7 @@ func Recoverer(next http.Handler) http.Handler {
 			}
 			logger.FromContext(r.Context()).Error("panic recovered",
 				"panic", rec, "stack", string(debug.Stack()))
+			errtrack.CapturePanic(r.Context(), rec, map[string]string{"path": r.URL.Path})
 			WriteError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 		}()
 		next.ServeHTTP(w, r)

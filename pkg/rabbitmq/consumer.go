@@ -11,8 +11,14 @@ import (
 
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
+	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/requestid"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
 
 // Delivery is a received message. Handlers get only what they need, not the AMQP types.
@@ -335,6 +341,7 @@ func deadLetterTo(target string, args amqp.Table) amqp.Table {
 func (c *Consumer) handle(session context.Context, fwd *forwarder, handler Handler, d amqp.Delivery) {
 	retry := RetryCount(d.Headers)
 	routingKey := OriginalRoutingKey(d)
+	queue := c.topology.Queue
 	log := c.log.With("message_id", d.MessageId, "routing_key", routingKey, "retry", retry)
 
 	if session.Err() != nil {
@@ -347,9 +354,24 @@ func (c *Consumer) handle(session context.Context, fwd *forwarder, handler Handl
 	hctx, cancel := context.WithTimeout(context.WithoutCancel(session), c.cfg.HandlerTimeout)
 	defer cancel()
 
-	queue := c.topology.Queue
+	// Continue the producer's trace and request ID: the handler's logs, its database
+	// queries, and the events it stores in its outbox belong to the same business flow.
+	hctx = telemetry.Extract(hctx, headerCarrier(d.Headers))
+	if id, ok := d.Headers[requestid.MessageHeader].(string); ok {
+		hctx = requestid.WithContext(hctx, id)
+	}
+	hctx, span := tracer.Start(hctx, routingKey+" process",
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(telemetry.MessagingAttributes(queue, d.MessageId)...),
+		trace.WithAttributes(attribute.Int("messaging.retry", retry)),
+	)
+	defer span.End()
+	log = logger.WithCorrelation(hctx, log)
+	hctx = logger.WithContext(hctx, log)
+	tags := map[string]string{"queue": queue, "event": routingKey, "message_id": d.MessageId}
+
 	start := time.Now()
-	err := safeCall(logger.WithContext(hctx, log), handler, Delivery{
+	err := safeCall(hctx, handler, tags, Delivery{
 		MessageID:   d.MessageId,
 		RoutingKey:  routingKey,
 		Body:        d.Body,
@@ -357,6 +379,10 @@ func (c *Consumer) handle(session context.Context, fwd *forwarder, handler Handl
 		Retry:       retry,
 	})
 	processingDuration.WithLabelValues(queue, routingKey).Observe(time.Since(start).Seconds())
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "handler failed")
+	}
 
 	var result string
 	switch {
@@ -367,9 +393,11 @@ func (c *Consumer) handle(session context.Context, fwd *forwarder, handler Handl
 		}
 	case IsPermanent(err):
 		log.Error("message rejected, moving it to the dead letter queue", "error", err)
+		errtrack.CaptureError(hctx, cause(err), tags)
 		result = c.forward(session, fwd, d, DeadLetterQueue(queue), deadLetterHeaders(d, routingKey, queue, retry, err), resultDeadLetter, log)
 	case retry >= len(c.cfg.RetryDelays):
 		log.Error("retries exhausted, moving the message to the dead letter queue", "error", err)
+		errtrack.CaptureError(hctx, cause(err), tags)
 		result = c.forward(session, fwd, d, DeadLetterQueue(queue), deadLetterHeaders(d, routingKey, queue, retry, err), resultDeadLetter, log)
 	default:
 		delay := c.cfg.RetryDelays[retry]
@@ -377,6 +405,7 @@ func (c *Consumer) handle(session context.Context, fwd *forwarder, handler Handl
 		result = c.forward(session, fwd, d, RetryQueue(queue, delay), retryHeaders(d, routingKey, retry+1, err), resultRetry, log)
 	}
 	consumedMessages.WithLabelValues(queue, routingKey, result).Inc()
+	span.SetAttributes(attribute.String("messaging.result", result))
 }
 
 // forward publishes a copy of the message to a retry queue or the DLQ and then acks the
@@ -412,14 +441,24 @@ func (c *Consumer) forward(session context.Context, fwd *forwarder, d amqp.Deliv
 }
 
 // safeCall turns a handler panic into an error, so one bad message cannot crash the service.
-func safeCall(ctx context.Context, handler Handler, d Delivery) (err error) {
+func safeCall(ctx context.Context, handler Handler, tags map[string]string, d Delivery) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.FromContext(ctx).Error("handler panicked", "panic", r, "stack", string(debug.Stack()))
+			errtrack.CapturePanic(ctx, r, tags)
 			err = fmt.Errorf("handler panic: %v", r)
 		}
 	}()
 	return handler(ctx, d)
+}
+
+// cause drops the Permanent wrapper, so error reports are titled by the real error.
+func cause(err error) error {
+	var p permanentError
+	if errors.As(err, &p) {
+		return p.err
+	}
+	return err
 }
 
 func nack(log *slog.Logger, d amqp.Delivery, requeue bool) {

@@ -57,7 +57,7 @@ func (f *fakeProvider) Charge(context.Context, ChargeRequest) (ChargeResult, err
 
 type discardLogger struct{}
 
-func (discardLogger) Info(string, ...any) {}
+func (discardLogger) InfoContext(context.Context, string, ...any) {}
 
 func validInput() ProcessPaymentInput {
 	return ProcessPaymentInput{OrderID: uuid.New(), CustomerID: uuid.New(), Amount: 119800, Currency: "RUB"}

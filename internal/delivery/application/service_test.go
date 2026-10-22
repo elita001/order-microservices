@@ -53,7 +53,7 @@ func (f *fakeCarrier) RegisterShipment(context.Context, RegisterShipmentRequest)
 
 type discardLogger struct{}
 
-func (discardLogger) Info(string, ...any) {}
+func (discardLogger) InfoContext(context.Context, string, ...any) {}
 
 func validInput() ShipOrderInput {
 	return ShipOrderInput{OrderID: uuid.New(), CustomerID: uuid.New()}

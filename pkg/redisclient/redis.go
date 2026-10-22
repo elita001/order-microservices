@@ -13,6 +13,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/redis/go-redis/extra/redisotel/v9"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/elita001/order-microservices/pkg/breaker"
@@ -52,6 +53,10 @@ func New(cfg Config, log *slog.Logger) (*redis.Client, error) {
 	opts.ContextTimeoutEnabled = true
 
 	client := redis.NewClient(opts)
+	// Every command becomes a span of the current trace.
+	if err := redisotel.InstrumentTracing(client); err != nil {
+		return nil, fmt.Errorf("instrument redis tracing: %w", err)
+	}
 	client.AddHook(&breakerHook{b: breaker.New[struct{}]("redis", cfg.Breaker, isFailure, log)})
 	return client, nil
 }

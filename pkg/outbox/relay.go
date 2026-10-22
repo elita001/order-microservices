@@ -10,7 +10,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
+
+var tracer = telemetry.Tracer("github.com/elita001/order-microservices/pkg/outbox")
 
 // Publisher sends a message to the broker and returns only after the broker has accepted it.
 type Publisher interface {
@@ -123,7 +131,7 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after commit
 
 	rows, err := tx.Query(ctx, fmt.Sprintf(`
-		SELECT id, aggregate_type, aggregate_id, event_type, payload, created_at
+		SELECT id, aggregate_type, aggregate_id, event_type, payload, created_at, headers
 		FROM %s
 		WHERE published_at IS NULL
 		ORDER BY created_at, id
@@ -134,7 +142,7 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 	}
 	msgs, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Message, error) {
 		var msg Message
-		err := row.Scan(&msg.ID, &msg.AggregateType, &msg.AggregateID, &msg.EventType, &msg.Payload, &msg.CreatedAt)
+		err := row.Scan(&msg.ID, &msg.AggregateType, &msg.AggregateID, &msg.EventType, &msg.Payload, &msg.CreatedAt, &msg.Headers)
 		return msg, err
 	})
 	if err != nil {
@@ -147,9 +155,7 @@ func (r *Relay) publishBatch(ctx context.Context) (int, error) {
 	published := make([]uuid.UUID, 0, len(msgs))
 	var publishErr error
 	for _, msg := range msgs {
-		pubCtx, cancelPub := context.WithTimeout(ctx, r.cfg.PublishTimeout)
-		err := r.publisher.Publish(pubCtx, msg)
-		cancelPub()
+		err := r.publish(ctx, msg)
 		if err != nil {
 			// Stop at the first failure: the broker is most likely unavailable,
 			// and continuing would also break the order of events.
@@ -203,6 +209,28 @@ func (r *Relay) cleanup(ctx context.Context) {
 	if total > 0 {
 		r.log.Info("outbox cleanup finished", "deleted", total)
 	}
+}
+
+// publish sends one message in a producer span. The span continues the trace of the
+// operation that stored the event (e.g., the HTTP request that created the order), even
+// though it runs later, so the trace shows the whole flow including the outbox delay.
+func (r *Relay) publish(ctx context.Context, msg Message) error {
+	ctx = telemetry.Extract(ctx, propagation.MapCarrier(msg.Headers))
+	ctx, span := tracer.Start(ctx, msg.EventType+" publish",
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(telemetry.MessagingAttributes(msg.EventType, msg.ID.String())...),
+		trace.WithAttributes(attribute.String("outbox.table", r.tableName)),
+	)
+	defer span.End()
+
+	ctx, cancel := context.WithTimeout(ctx, r.cfg.PublishTimeout)
+	defer cancel()
+	if err := r.publisher.Publish(ctx, msg); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "publish failed")
+		return err
+	}
+	return nil
 }
 
 // observeBacklog updates the backlog metrics. The partial index on unpublished messages

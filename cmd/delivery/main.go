@@ -21,6 +21,7 @@ import (
 	"github.com/elita001/order-microservices/internal/delivery/adapter/provider"
 	"github.com/elita001/order-microservices/internal/delivery/application"
 	"github.com/elita001/order-microservices/pkg/breaker"
+	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -28,6 +29,7 @@ import (
 	"github.com/elita001/order-microservices/pkg/outbox"
 	"github.com/elita001/order-microservices/pkg/postgres"
 	"github.com/elita001/order-microservices/pkg/rabbitmq"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
 
 const serviceName = "delivery-service"
@@ -37,6 +39,9 @@ type config struct {
 	PostgresDSN     string        `env:"POSTGRES_DSN,required"`
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
+
+	Telemetry telemetry.Config // OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_TRACES_SAMPLER_RATIO
+	ErrTrack  errtrack.Config  // SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_RELEASE
 
 	RabbitMQURL      string `env:"RABBITMQ_URL,required"`
 	RabbitMQExchange string `env:"RABBITMQ_EXCHANGE" envDefault:"orderflow.events"`
@@ -68,6 +73,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTracing, err := telemetry.Setup(ctx, serviceName, cfg.Telemetry)
+	if err != nil {
+		return fmt.Errorf("set up tracing: %w", err)
+	}
+	defer func() {
+		// Send the spans still in the buffer; ctx is already canceled at this point.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Warn("flush traces", "error", err)
+		}
+	}()
+	flushErrors, err := errtrack.Init(serviceName, cfg.ErrTrack, log)
+	if err != nil {
+		return fmt.Errorf("set up error tracking: %w", err)
+	}
+	defer flushErrors()
+
 	pool, err := postgres.Connect(ctx, cfg.PostgresDSN, log)
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
@@ -91,14 +114,14 @@ func run() error {
 	// The delivery service has no public API yet; HTTP serves health probes
 	// (and metrics in a later step).
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, httpx.Logger(log), metrics.HTTP, httpx.Recoverer)
+	r.Use(middleware.RequestID, httpx.Logger(log), metrics.HTTP, telemetry.RouteName, httpx.Recoverer)
 	// Internal port: Prometheus scrapes it directly, clients never reach it.
 	r.Handle("/metrics", metrics.Handler())
 	httpx.RegisterHealth(r, pool.Ping)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           r,
+		Handler:           telemetry.HTTPHandler(r),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

@@ -42,8 +42,9 @@ type RegisterShipmentResult struct {
 }
 
 // Logger is the logging capability required by the application service.
+// It is called with the request context, so the records carry request_id and trace_id.
 type Logger interface {
-	Info(message string, args ...any)
+	InfoContext(ctx context.Context, message string, args ...any)
 }
 
 // Metrics records business metrics; a Prometheus adapter implements it.
@@ -107,7 +108,7 @@ func (s *Service) ShipOrder(ctx context.Context, in ShipOrderInput) error {
 		return fmt.Errorf("get or create shipment for order %s: %w", in.OrderID, err)
 	}
 	if shipment.Status != domain.StatusPending {
-		s.logger.Info("shipment already registered, skipping",
+		s.logger.InfoContext(ctx, "shipment already registered, skipping",
 			"shipment_id", shipment.ID, "order_id", shipment.OrderID)
 		return nil
 	}
@@ -131,12 +132,12 @@ func (s *Service) ShipOrder(ctx context.Context, in ShipOrderInput) error {
 	}
 	if !completed {
 		// Another delivery of the same message registered the shipment concurrently.
-		s.logger.Info("shipment registered concurrently, skipping", "shipment_id", shipment.ID, "order_id", shipment.OrderID)
+		s.logger.InfoContext(ctx, "shipment registered concurrently, skipping", "shipment_id", shipment.ID, "order_id", shipment.OrderID)
 		return nil
 	}
 
 	s.metrics.ShipmentRegistered(shipment.Carrier)
-	s.logger.Info("shipment registered",
+	s.logger.InfoContext(ctx, "shipment registered",
 		"shipment_id", shipment.ID,
 		"order_id", shipment.OrderID,
 		"carrier", shipment.Carrier,

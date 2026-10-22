@@ -64,7 +64,7 @@ func (f *fakeMailer) Send(_ context.Context, email Email) error {
 
 type discardLogger struct{}
 
-func (discardLogger) Info(string, ...any) {}
+func (discardLogger) InfoContext(context.Context, string, ...any) {}
 
 func orderCreatedInput() OrderCreatedInput {
 	return OrderCreatedInput{

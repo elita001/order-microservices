@@ -17,6 +17,7 @@ import (
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/metrics"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
 
 type Config struct {
@@ -35,7 +36,7 @@ func NewRouter(cfg Config, rdb *redis.Client, log *slog.Logger) http.Handler {
 
 	r := chi.NewRouter()
 	// metrics.HTTP sits outside Recoverer, so a recovered panic is counted as a 500.
-	r.Use(httpx.RequestID, httpx.Logger(log), metrics.HTTP, httpx.Recoverer)
+	r.Use(httpx.RequestID, httpx.Logger(log), metrics.HTTP, telemetry.RouteName, httpx.Recoverer)
 
 	// The gateway is ready while it runs: Redis is optional (fail-open), and an unavailable
 	// upstream must not take the whole entry point out of the load balancer.

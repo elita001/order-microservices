@@ -45,8 +45,9 @@ type ChargeResult struct {
 }
 
 // Logger is the logging capability required by the application service.
+// It is called with the request context, so the records carry request_id and trace_id.
 type Logger interface {
-	Info(message string, args ...any)
+	InfoContext(ctx context.Context, message string, args ...any)
 }
 
 // Metrics records business metrics; a Prometheus adapter implements it.
@@ -111,7 +112,7 @@ func (s *Service) ProcessPayment(ctx context.Context, in ProcessPaymentInput) er
 		return fmt.Errorf("get or create payment for order %s: %w", in.OrderID, err)
 	}
 	if payment.Status != domain.StatusPending {
-		s.logger.Info("payment already processed, skipping",
+		s.logger.InfoContext(ctx, "payment already processed, skipping",
 			"payment_id", payment.ID, "order_id", payment.OrderID, "status", payment.Status)
 		return nil
 	}
@@ -142,12 +143,12 @@ func (s *Service) ProcessPayment(ctx context.Context, in ProcessPaymentInput) er
 	}
 	if !completed {
 		// Another delivery of the same message completed the payment concurrently.
-		s.logger.Info("payment completed concurrently, skipping", "payment_id", payment.ID, "order_id", payment.OrderID)
+		s.logger.InfoContext(ctx, "payment completed concurrently, skipping", "payment_id", payment.ID, "order_id", payment.OrderID)
 		return nil
 	}
 
 	s.metrics.PaymentCompleted(payment.Status, payment.FailureReason, payment.Currency, payment.Amount)
-	s.logger.Info("payment processed",
+	s.logger.InfoContext(ctx, "payment processed",
 		"payment_id", payment.ID,
 		"order_id", payment.OrderID,
 		"status", payment.Status,

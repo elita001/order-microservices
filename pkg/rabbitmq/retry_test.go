@@ -76,3 +76,13 @@ func TestOriginalRoutingKey_FirstDelivery(t *testing.T) {
 		t.Errorf("got %q, want order.created", got)
 	}
 }
+
+func TestCause_UnwrapsPermanent(t *testing.T) {
+	inner := errors.New("decode order.created: invalid JSON")
+	if got := cause(Permanent(inner)); got != inner {
+		t.Errorf("cause(Permanent(err)) = %v, want the inner error", got)
+	}
+	if got := cause(inner); got != inner {
+		t.Errorf("cause(err) = %v, want err itself", got)
+	}
+}

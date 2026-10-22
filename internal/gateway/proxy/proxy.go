@@ -12,6 +12,7 @@ import (
 
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
 
 // Config is usually loaded from environment variables with the UPSTREAM_ prefix.
@@ -37,7 +38,8 @@ func New(target *url.URL, cfg Config) http.Handler {
 			pr.SetURL(target)
 			pr.SetXForwarded()
 		},
-		Transport:    transport,
+		// Traces the upstream call and forwards the trace context in the traceparent header.
+		Transport:    telemetry.HTTPTransport(transport),
 		ErrorHandler: handleError,
 	}
 

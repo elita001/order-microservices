@@ -1,0 +1,101 @@
+// Grafana Alloy: the single telemetry agent of the system.
+//   logs:   container stdout (Docker) -> parse JSON -> Loki
+//   traces: OTLP from the services     -> batch       -> Tempo
+// UI with the component graph: http://localhost:12345
+
+// ---------- Logs ----------
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = []
+
+  // Only this compose project: other stacks on the same Docker host are ignored.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = sys.env("COMPOSE_PROJECT")
+    action        = "keep"
+  }
+  // The compose service name (order, payment, postgres, ...) becomes the "service" label.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+loki.source.docker "containers" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.containers.targets
+  relabel_rules = discovery.relabel.containers.rules
+  forward_to    = [loki.process.services.receiver]
+}
+
+loki.process "services" {
+  // Our services log JSON (log/slog). Infrastructure containers keep their raw lines.
+  stage.match {
+    selector = "{service=~\"gateway|order|payment|delivery|notification\"}"
+
+    stage.json {
+      expressions = {
+        level      = "level",
+        time       = "time",
+        request_id = "request_id",
+        trace_id   = "trace_id",
+      }
+    }
+    // A few values per service: fine as an indexed label.
+    stage.labels {
+      values = { level = "" }
+    }
+    // Unique per request: structured metadata, searchable without creating streams.
+    stage.structured_metadata {
+      values = {
+        request_id = "",
+        trace_id   = "",
+      }
+    }
+    stage.timestamp {
+      source = "time"
+      format = "RFC3339Nano"
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+// ---------- Traces ----------
+
+otelcol.receiver.otlp "default" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  output {
+    traces = [otelcol.processor.batch.default.input]
+  }
+}
+
+otelcol.processor.batch "default" {
+  output {
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+    tls {
+      insecure = true
+    }
+  }
+}

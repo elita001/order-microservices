@@ -10,8 +10,14 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/elita001/order-microservices/internal/delivery/application"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
+
+var tracer = telemetry.Tracer("github.com/elita001/order-microservices/internal/delivery/adapter/provider")
 
 // StubConfig is usually loaded from environment variables with the DELIVERY_STUB_ prefix.
 type StubConfig struct {
@@ -41,7 +47,17 @@ func NewStub(cfg StubConfig) *Stub {
 	return &Stub{cfg: cfg, now: func() time.Time { return time.Now().UTC() }}
 }
 
-func (s *Stub) RegisterShipment(ctx context.Context, req application.RegisterShipmentRequest) (application.RegisterShipmentResult, error) {
+func (s *Stub) RegisterShipment(ctx context.Context, req application.RegisterShipmentRequest) (_ application.RegisterShipmentResult, err error) {
+	// A client span for the external call shows on the trace how long the carrier took.
+	ctx, span := tracer.Start(ctx, "carrier.register_shipment", trace.WithSpanKind(trace.SpanKindClient))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "register shipment failed")
+		}
+		span.End()
+	}()
+
 	select {
 	case <-ctx.Done():
 		return application.RegisterShipmentResult{}, fmt.Errorf("carrier: %w", ctx.Err())

@@ -71,7 +71,7 @@ func (f *fakeRepo) UpdateStatus(_ context.Context, id uuid.UUID, from []domain.S
 
 type discardLogger struct{}
 
-func (discardLogger) Info(string, ...any) {}
+func (discardLogger) InfoContext(context.Context, string, ...any) {}
 
 func newTestService(repo Repository) *Service {
 	return NewService(repo, discardLogger{})

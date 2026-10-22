@@ -11,12 +11,30 @@ x-migrate: &migrate
     postgres:
       condition: service_healthy
 
+# Telemetry settings of every Go service: traces go to Alloy over OTLP, errors to GlitchTip.
+# SENTRY_DSN can point to sentry.io instead; the key below is created by glitchtip-init.
+x-telemetry-env: &telemetry-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+  SENTRY_DSN: ${SENTRY_DSN:-http://${GLITCHTIP_DSN_KEY}@glitchtip:8000/1}
+  SENTRY_ENVIRONMENT: development
+
 # Settings shared by the services that consume events.
 x-consumer-env: &consumer-env
+  <<: *telemetry-env
   RABBITMQ_URL: *rabbitmq-url
   POSTGRES_DSN: *database-url
   LOG_LEVEL: ${LOG_LEVEL:-info}
   CONSUMER_RETRY_DELAYS: ${CONSUMER_RETRY_DELAYS:-1s,5s,30s,2m,10m}
+
+x-glitchtip-env: &glitchtip-env
+  DATABASE_URL: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/glitchtip"
+  REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/1" # a separate Redis database
+  SECRET_KEY: ${GLITCHTIP_SECRET_KEY:?copy .env.example to .env}
+  GLITCHTIP_DOMAIN: "http://localhost:${GLITCHTIP_PORT:-8000}"
+  DEFAULT_FROM_EMAIL: glitchtip@orderflow.local
+  EMAIL_URL: consolemail://
+  ENABLE_USER_REGISTRATION: "false"
+  ENABLE_ORGANIZATION_CREATION: "false"
 
 x-service: &service
   build:
@@ -131,6 +149,7 @@ services:
       args:
         SERVICE: gateway
     environment:
+      <<: *telemetry-env
       HTTP_ADDR: ":8080"
       LOG_LEVEL: ${LOG_LEVEL:-info}
       ORDER_SERVICE_URL: "http://order:8081"
@@ -269,6 +288,8 @@ services:
       # Stores a 0 when a counter is created, so increase() does not lose the first events
       # of a series that appears with a non-zero value (e.g., right after a service starts).
       - --enable-feature=created-timestamp-zero-ingestion
+      # Tempo writes the service graph metrics here (Prometheus remote write protocol).
+      - --web.enable-remote-write-receiver
     volumes:
       - ./deploy/prometheus:/etc/prometheus:ro
       - promdata:/prometheus
@@ -284,6 +305,9 @@ services:
       # Anyone can view dashboards locally without logging in.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # Viewers may use Explore (ad-hoc log and trace queries); dashboards stay read-only
+      # because they are provisioned from files.
+      GF_USERS_VIEWERS_CAN_EDIT: "true"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
     volumes:
       - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -292,9 +316,98 @@ services:
       - "${GRAFANA_PORT:-3000}:3000"
     depends_on:
       - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+
+  # Logs: Alloy reads the containers' stdout and pushes it to Loki.
+  loki:
+    image: grafana/loki:3.5.5
+    command: ["-config.file=/etc/loki/config.yml"]
+    volumes:
+      - ./deploy/loki/config.yml:/etc/loki/config.yml:ro
+      - lokidata:/loki
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    restart: unless-stopped
+
+  # Traces: the services send spans to Alloy, which forwards them to Tempo.
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo/config.yml"]
+    volumes:
+      - ./deploy/tempo/config.yml:/etc/tempo/config.yml:ro
+      - tempodata:/var/tempo
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.10.2
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    environment:
+      COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME} # collect logs of this project only
+    volumes:
+      - ./deploy/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      # Read-only access to the Docker API to discover containers and read their logs.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "${ALLOY_UI_PORT:-12345}:12345"
+    depends_on:
+      - loki
+      - tempo
+    restart: unless-stopped
+
+  # Error tracking: GlitchTip is a lightweight, Sentry-compatible server (the services use
+  # the official sentry-go SDK). It keeps its data in its own database of the shared PostgreSQL.
+  glitchtip-db:
+    image: postgres:16-alpine
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+    command:
+      - sh
+      - -c
+      - psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'glitchtip'" | grep -q 1 || psql -c "CREATE DATABASE glitchtip"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Migrations and the admin user, organization, and project with the DSN key from .env.
+  glitchtip-init:
+    image: glitchtip/glitchtip:v5.1.1
+    environment:
+      <<: *glitchtip-env
+      GLITCHTIP_ADMIN_EMAIL: ${GLITCHTIP_ADMIN_EMAIL:-admin@orderflow.local}
+      GLITCHTIP_ADMIN_PASSWORD: ${GLITCHTIP_ADMIN_PASSWORD:?copy .env.example to .env}
+      GLITCHTIP_DSN_KEY: ${GLITCHTIP_DSN_KEY:?copy .env.example to .env}
+    command: ["sh", "-c", "./manage.py migrate --no-input && ./manage.py shell < /bootstrap/bootstrap.py"]
+    volumes:
+      - ./deploy/glitchtip/bootstrap.py:/bootstrap/bootstrap.py:ro
+    depends_on:
+      glitchtip-db:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  glitchtip:
+    image: glitchtip/glitchtip:v5.1.1
+    command: ["./bin/run-all-in-one.sh"] # web server and background workers in one process
+    environment: *glitchtip-env
+    ports:
+      - "${GLITCHTIP_PORT:-8000}:8000"
+    depends_on:
+      glitchtip-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:
   pgdata:
   rabbitmqdata:
   promdata:
+  lokidata:
+  tempodata:

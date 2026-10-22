@@ -18,10 +18,12 @@ import (
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
 	"github.com/elita001/order-microservices/internal/gateway/proxy"
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
+	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/logger"
 	"github.com/elita001/order-microservices/pkg/metrics"
 	"github.com/elita001/order-microservices/pkg/redisclient"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
 
 type config struct {
@@ -30,6 +32,9 @@ type config struct {
 	MetricsAddr     string        `env:"METRICS_ADDR" envDefault:":9080"`
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
 	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"10s"`
+
+	Telemetry telemetry.Config // OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_TRACES_SAMPLER_RATIO
+	ErrTrack  errtrack.Config  // SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_RELEASE
 
 	OrderServiceURL string `env:"ORDER_SERVICE_URL,required"`
 
@@ -68,6 +73,24 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTracing, err := telemetry.Setup(ctx, "gateway", cfg.Telemetry)
+	if err != nil {
+		return fmt.Errorf("set up tracing: %w", err)
+	}
+	defer func() {
+		// Send the spans still in the buffer; ctx is already canceled at this point.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Warn("flush traces", "error", err)
+		}
+	}()
+	flushErrors, err := errtrack.Init("gateway", cfg.ErrTrack, log)
+	if err != nil {
+		return fmt.Errorf("set up error tracking: %w", err)
+	}
+	defer flushErrors()
+
 	rdb, err := redisclient.New(cfg.Redis, log)
 	if err != nil {
 		return fmt.Errorf("create redis client: %w", err)
@@ -90,7 +113,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           router,
+		Handler:           telemetry.HTTPHandler(router),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		// Longer than the upstream timeout, so the gateway can still send its 504.

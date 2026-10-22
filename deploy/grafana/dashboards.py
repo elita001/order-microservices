@@ -10,14 +10,15 @@ import pathlib
 
 OUT = pathlib.Path(__file__).resolve().parent / "dashboards"
 DS = {"type": "prometheus", "uid": "prometheus"}
+LOKI = {"type": "loki", "uid": "loki"}
 SERVICES = "gateway|order|payment|delivery|notification"
 
 # Status colors are reserved for state (thresholds, up/down, breaker state).
 GOOD, WARN, BAD = "green", "#EAB839", "red"
 
 
-def target(expr, legend="", instant=False, ref="A"):
-    t = {"refId": ref, "datasource": DS, "expr": expr, "legendFormat": legend or "__auto"}
+def target(expr, legend="", instant=False, ref="A", ds=DS):
+    t = {"refId": ref, "datasource": ds, "expr": expr, "legendFormat": legend or "__auto"}
     if instant:
         t.update(instant=True, range=False)
     return t
@@ -32,10 +33,10 @@ class Builder:
     def __init__(self):
         self.panels, self.x, self.y, self.row_h, self.id = [], 0, 0, 0, 1
 
-    def add(self, panel, w, h):
+    def add(self, panel, w, h, ds=DS):
         if self.x + w > 24:
             self.x, self.y, self.row_h = 0, self.y + self.row_h, 0
-        panel.update(id=self.id, gridPos={"h": h, "w": w, "x": self.x, "y": self.y}, datasource=DS)
+        panel.update(id=self.id, gridPos={"h": h, "w": w, "x": self.x, "y": self.y}, datasource=ds)
         self.id += 1
         self.x += w
         self.row_h = max(self.row_h, h)
@@ -64,7 +65,7 @@ class Builder:
                               "textMode": "value_and_name" if legend else "value", "justifyMode": "center",
                               "orientation": "auto", "wideLayout": True}}, w, h)
 
-    def timeseries(self, title, targets, unit="short", w=12, h=8, steps=None, desc="", stack=False, min0=True):
+    def timeseries(self, title, targets, unit="short", w=12, h=8, steps=None, desc="", stack=False, min0=True, ds=DS):
         """A ratio (percentunit) gets a fixed 0..100% axis."""
         custom = {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 if stack else 0, "showPoints": "never",
                   "spanNulls": True, "stacking": {"mode": "normal" if stack else "none", "group": "A"},
@@ -77,10 +78,16 @@ class Builder:
         if steps:
             defaults["thresholds"] = thresholds(*steps)
         self.add({"type": "timeseries", "title": title, "description": desc,
-                  "targets": [target(e, l, ref=chr(65 + i)) for i, (e, l) in enumerate(targets)],
+                  "targets": [target(e, l, ref=chr(65 + i), ds=ds) for i, (e, l) in enumerate(targets)],
                   "fieldConfig": {"defaults": defaults, "overrides": []},
                   "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": True},
-                              "tooltip": {"mode": "multi", "sort": "desc"}}}, w, h)
+                              "tooltip": {"mode": "multi", "sort": "desc"}}}, w, h, ds)
+
+    def logs(self, title, expr, w=24, h=16, desc=""):
+        self.add({"type": "logs", "title": title, "description": desc,
+                  "targets": [target(expr, ds=LOKI) | {"queryType": "range"}],
+                  "options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending",
+                              "enableLogDetails": True, "dedupStrategy": "none", "prettifyLogMessage": False}}, w, h, LOKI)
 
     def bars(self, title, expr, legend, unit="short", w=8, h=8, desc=""):
         self.add({"type": "bargauge", "title": title, "description": desc,
@@ -100,16 +107,17 @@ class Builder:
                   "options": {"showHeader": True, "sortBy": [{"displayName": "Value", "desc": True}]}}, w, h)
 
 
-def dashboard(uid, title, description, builder, links):
+def dashboard(uid, title, description, builder, links, variables=()):
     return {"uid": uid, "title": title, "description": description, "tags": ["orderflow"],
             "timezone": "browser", "editable": False, "graphTooltip": 1, "refresh": "10s",
             "schemaVersion": 39, "version": 1, "time": {"from": "now-30m", "to": "now"},
-            "templating": {"list": []}, "annotations": {"list": []},
+            "templating": {"list": list(variables)}, "annotations": {"list": []},
             "links": [{"title": t, "type": "link", "url": f"/d/{u}", "icon": "dashboard"} for t, u in links],
             "panels": builder.panels}
 
 
-LINKS = [("Business", "orderflow-business"), ("Services", "orderflow-services"), ("Messaging", "orderflow-messaging")]
+LINKS = [("Business", "orderflow-business"), ("Services", "orderflow-services"), ("Messaging", "orderflow-messaging"),
+         ("Logs", "orderflow-logs")]
 
 # ---------- Business ----------
 b = Builder()
@@ -197,6 +205,26 @@ b.timeseries("Oldest pending event", [('outbox_oldest_pending_age_seconds', "{{t
 messaging = dashboard("orderflow-messaging", "OrderFlow - Messaging",
                       "Consumers, retries, dead letter queues, RabbitMQ queue depth, and the transactional outbox.", b, LINKS)
 
-for name, d in [("overview", business), ("services", services), ("messaging", messaging)]:
+# ---------- Logs (Loki) ----------
+b = Builder()
+APP = '{service=~"$service"}'
+b.timeseries("Log lines by level", [(f'sum by (level) (count_over_time({{service=~"$service", level=~".+"}}[1m]))', "{{level}}")],
+             w=12, ds=LOKI)
+b.timeseries("Errors by service", [(f'sum by (service) (count_over_time({{service=~"$service", level="ERROR"}}[1m]))', "{{service}}")],
+             w=12, ds=LOKI, desc="ERROR records per minute. Find the cause in the logs below by request_id or open the trace.")
+b.logs("Logs", f'{APP} | request_id=~"$request_id.*"',
+       desc="Enter a request ID above to see one order's whole flow across all services. "
+            "Expand a record and use the trace_id link to open its trace in Tempo.")
+variables = [
+    {"type": "custom", "name": "service", "label": "Service", "query": "gateway,order,payment,delivery,notification",
+     "multi": True, "includeAll": True, "allValue": "gateway|order|payment|delivery|notification",
+     "current": {"selected": True, "text": ["All"], "value": ["$__all"]}},
+    {"type": "textbox", "name": "request_id", "label": "Request ID", "query": "",
+     "current": {"text": "", "value": ""}},
+]
+logs = dashboard("orderflow-logs", "OrderFlow - Logs",
+                 "Logs of all services in Loki, filterable by request ID, with links to traces in Tempo.", b, LINKS, variables)
+
+for name, d in [("overview", business), ("services", services), ("messaging", messaging), ("logs", logs)]:
     (OUT / f"{name}.json").write_text(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
     print(name, len(d["panels"]), "panels")

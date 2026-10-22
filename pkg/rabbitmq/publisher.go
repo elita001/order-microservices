@@ -9,6 +9,8 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/elita001/order-microservices/pkg/outbox"
+	"github.com/elita001/order-microservices/pkg/requestid"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
 
 // Publisher publishes outbox messages to a topic exchange using the event type as the
@@ -50,8 +52,18 @@ func (p *Publisher) Publish(ctx context.Context, msg outbox.Message) (err error)
 		return err
 	}
 
-	// mandatory=false: until consumers bind their queues (next steps), unroutable
-	// messages are dropped by the broker instead of being returned.
+	headers := amqp.Table{
+		"aggregate_type": msg.AggregateType,
+		"aggregate_id":   msg.AggregateID,
+	}
+	if id := msg.Headers[requestid.MessageHeader]; id != "" {
+		headers[requestid.MessageHeader] = id
+	}
+	// The producer span of ctx becomes the parent of the consumers' spans.
+	telemetry.Inject(ctx, headerCarrier(headers))
+
+	// mandatory=false: a message with no bound queue is dropped by the broker instead of
+	// being returned; every consumer declares and binds its queue on connect.
 	confirm, err := ch.PublishWithDeferredConfirmWithContext(ctx, p.exchange, msg.EventType, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
@@ -59,11 +71,8 @@ func (p *Publisher) Publish(ctx context.Context, msg outbox.Message) (err error)
 		Type:         msg.EventType,
 		Timestamp:    msg.CreatedAt,
 		AppId:        p.appID,
-		Headers: amqp.Table{
-			"aggregate_type": msg.AggregateType,
-			"aggregate_id":   msg.AggregateID,
-		},
-		Body: msg.Payload,
+		Headers:      headers,
+		Body:         msg.Payload,
 	})
 	if err != nil {
 		return fmt.Errorf("publish: %w", err)

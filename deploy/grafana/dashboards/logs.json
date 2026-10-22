@@ -1,0 +1,241 @@
+{
+  "uid": "orderflow-logs",
+  "title": "OrderFlow - Logs",
+  "description": "Logs of all services in Loki, filterable by request ID, with links to traces in Tempo.",
+  "tags": [
+    "orderflow"
+  ],
+  "timezone": "browser",
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "type": "custom",
+        "name": "service",
+        "label": "Service",
+        "query": "gateway,order,payment,delivery,notification",
+        "multi": true,
+        "includeAll": true,
+        "allValue": "gateway|order|payment|delivery|notification",
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        }
+      },
+      {
+        "type": "textbox",
+        "name": "request_id",
+        "label": "Request ID",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "links": [
+    {
+      "title": "Business",
+      "type": "link",
+      "url": "/d/orderflow-business",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Services",
+      "type": "link",
+      "url": "/d/orderflow-services",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Messaging",
+      "type": "link",
+      "url": "/d/orderflow-messaging",
+      "icon": "dashboard"
+    },
+    {
+      "title": "Logs",
+      "type": "link",
+      "url": "/d/orderflow-logs",
+      "icon": "dashboard"
+    }
+  ],
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Log lines by level",
+      "description": "",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum by (level) (count_over_time({service=~\"$service\", level=~\".+\"}[1m]))",
+          "legendFormat": "{{level}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors by service",
+      "description": "ERROR records per minute. Find the cause in the logs below by request_id or open the trace.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "sum by (service) (count_over_time({service=~\"$service\", level=\"ERROR\"}[1m]))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      }
+    },
+    {
+      "type": "logs",
+      "title": "Logs",
+      "description": "Enter a request ID above to see one order's whole flow across all services. Expand a record and use the trace_id link to open its trace in Tempo.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{service=~\"$service\"} | request_id=~\"$request_id.*\"",
+          "legendFormat": "__auto",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "prettifyLogMessage": false
+      },
+      "id": 3,
+      "gridPos": {
+        "h": 16,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      }
+    }
+  ]
+}

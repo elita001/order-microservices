@@ -8,8 +8,15 @@ import (
 
 	"github.com/wneessen/go-mail"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/elita001/order-microservices/internal/notification/application"
+	"github.com/elita001/order-microservices/pkg/telemetry"
 )
+
+var tracer = telemetry.Tracer("github.com/elita001/order-microservices/internal/notification/adapter/smtp")
 
 // Config is usually loaded from environment variables with the SMTP_ prefix.
 type Config struct {
@@ -43,7 +50,17 @@ func NewMailer(cfg Config) *Mailer {
 
 // Send opens a new SMTP connection for every email. That is simple and safe for
 // concurrent use; a connection pool is only worth it at much higher volumes.
-func (m *Mailer) Send(ctx context.Context, email application.Email) error {
+func (m *Mailer) Send(ctx context.Context, email application.Email) (err error) {
+	ctx, span := tracer.Start(ctx, "smtp.send", trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("server.address", m.cfg.Host)))
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "send failed")
+		}
+		span.End()
+	}()
+
 	msg := mail.NewMsg()
 	if err := msg.From(m.cfg.From); err != nil {
 		return fmt.Errorf("set sender: %w", err)

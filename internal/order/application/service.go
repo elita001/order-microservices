@@ -41,8 +41,9 @@ type Repository interface {
 }
 
 // Logger is the logging capability required by the application service.
+// It is called with the request context, so the records carry request_id and trace_id.
 type Logger interface {
-	Info(message string, args ...any)
+	InfoContext(ctx context.Context, message string, args ...any)
 }
 
 // Metrics records business metrics; a Prometheus adapter implements it.
@@ -159,7 +160,7 @@ func (s *Service) Create(ctx context.Context, in CreateOrderInput) (*CreateOrder
 	}
 
 	s.metrics.OrderCreated(order.Currency)
-	s.logger.Info("order created",
+	s.logger.InfoContext(ctx, "order created",
 		"order_id", order.ID,
 		"customer_id", order.CustomerID,
 		"total_amount", order.TotalAmount,
@@ -180,7 +181,7 @@ func (s *Service) replay(ctx context.Context, key, hash string) (*CreateOrderRes
 	if existing.RequestHash != hash {
 		return nil, domain.ErrIdempotencyKeyReused
 	}
-	s.logger.Info("order request replayed", "order_id", existing.ID)
+	s.logger.InfoContext(ctx, "order request replayed", "order_id", existing.ID)
 	return &CreateOrderResult{Order: existing, Replayed: true}, nil
 }
 
@@ -251,13 +252,13 @@ func (s *Service) changeStatus(ctx context.Context, orderID uuid.UUID, from []do
 		return fmt.Errorf("change status of order %s to %s: %w", orderID, to, err)
 	}
 	if !updated {
-		s.logger.Info("order status not changed: order is in another status or does not exist",
+		s.logger.InfoContext(ctx, "order status not changed: order is in another status or does not exist",
 			"order_id", orderID, "target_status", to)
 		return nil
 	}
 
 	s.metrics.OrderStatusChanged(to)
-	s.logger.Info("order status changed",
+	s.logger.InfoContext(ctx, "order status changed",
 		"order_id", orderID,
 		"status", to,
 		"reason", reason,
