@@ -1,0 +1,7 @@
+# Normalize line endings: the repository always stores LF, whatever core.autocrlf is set to.
+# gofmt, golangci-lint, make (a CR in a recipe breaks it), shell scripts in containers, and
+# SQL migrations all expect LF, also when the files are edited on Windows.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary

@@ -64,7 +64,7 @@ func (s *Stub) RegisterShipment(ctx context.Context, req application.RegisterShi
 	case <-time.After(s.delay()):
 	}
 	// Technical errors are random, not derived from the key: a retry may succeed.
-	if rand.Float64() < s.cfg.ErrorRate {
+	if rand.Float64() < s.cfg.ErrorRate { //nolint:gosec // simulated failures, not security
 		return application.RegisterShipmentResult{}, ErrUnavailable
 	}
 
@@ -85,5 +85,5 @@ func (s *Stub) delay() time.Duration {
 	if spread <= 0 {
 		return max(s.cfg.MinDelay, 0)
 	}
-	return s.cfg.MinDelay + rand.N(spread)
+	return s.cfg.MinDelay + rand.N(spread) //nolint:gosec // simulated latency, not security
 }

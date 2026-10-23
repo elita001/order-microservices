@@ -205,7 +205,7 @@ func TestCache_BreakerSkipsHangingRedis(t *testing.T) {
 
 func TestCache_NotFoundIsNotCached(t *testing.T) {
 	env := newTestEnv(t)
-	if _, err := env.cache.GetByID(context.Background(), uuid.New()); err != domain.ErrNotFound {
+	if _, err := env.cache.GetByID(context.Background(), uuid.New()); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 	if keys := env.redis.Keys(); len(keys) != 0 {

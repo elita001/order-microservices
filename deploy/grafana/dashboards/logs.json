@@ -8,23 +8,176 @@
   "timezone": "browser",
   "editable": false,
   "graphTooltip": 1,
-  "refresh": "10s",
-  "schemaVersion": 39,
-  "version": 1,
   "time": {
     "from": "now-30m",
     "to": "now"
   },
+  "fiscalYearStartMonth": 0,
+  "refresh": "10s",
+  "schemaVersion": 42,
+  "panels": [
+    {
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (level) (count_over_time({service=~\"$service\", level=~\".+\"}[1m]))",
+          "legendFormat": "{{level}}",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          }
+        }
+      ],
+      "title": "Log lines by level",
+      "transparent": false,
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "repeatDirection": "h",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (service) (count_over_time({service=~\"$service\", level=\"ERROR\"}[1m]))",
+          "legendFormat": "{{service}}",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          }
+        }
+      ],
+      "title": "Errors by service",
+      "description": "ERROR records per minute. Find the cause in the logs below by request_id or open the trace.",
+      "transparent": false,
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "repeatDirection": "h",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "logs",
+      "targets": [
+        {
+          "expr": "{service=~\"$service\"} | request_id=~\"$request_id.*\"",
+          "legendFormat": "__auto",
+          "refId": "A",
+          "queryType": "range",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          }
+        }
+      ],
+      "title": "Logs",
+      "description": "Enter a request ID above to see one order's whole flow across all services. Expand a record and use the trace_id link to open its trace in Tempo.",
+      "transparent": false,
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 16,
+        "w": 24,
+        "x": 0,
+        "y": 8
+      },
+      "repeatDirection": "h",
+      "options": {
+        "showLabels": false,
+        "showCommonLabels": false,
+        "showTime": true,
+        "showLogContextToggle": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      }
+    }
+  ],
   "templating": {
     "list": [
       {
         "type": "custom",
         "name": "service",
         "label": "Service",
+        "skipUrlSync": false,
         "query": "gateway,order,payment,delivery,notification",
-        "multi": true,
-        "includeAll": true,
-        "allValue": "gateway|order|payment|delivery|notification",
         "current": {
           "selected": true,
           "text": [
@@ -33,209 +186,82 @@
           "value": [
             "$__all"
           ]
-        }
+        },
+        "multi": true,
+        "allowCustomValue": true,
+        "includeAll": true,
+        "allValue": "gateway|order|payment|delivery|notification",
+        "auto": false,
+        "auto_min": "10s",
+        "auto_count": 30
       },
       {
         "type": "textbox",
         "name": "request_id",
         "label": "Request ID",
-        "query": "",
-        "current": {
-          "text": "",
-          "value": ""
-        }
+        "skipUrlSync": false,
+        "multi": false,
+        "allowCustomValue": true,
+        "includeAll": false,
+        "auto": false,
+        "auto_min": "10s",
+        "auto_count": 30
       }
     ]
   },
-  "annotations": {
-    "list": []
-  },
+  "annotations": {},
   "links": [
     {
       "title": "Business",
       "type": "link",
+      "icon": "dashboard",
+      "tooltip": "",
       "url": "/d/orderflow-business",
-      "icon": "dashboard"
+      "tags": [],
+      "asDropdown": false,
+      "placement": "inControlsMenu",
+      "targetBlank": false,
+      "includeVars": false,
+      "keepTime": false
     },
     {
       "title": "Services",
       "type": "link",
+      "icon": "dashboard",
+      "tooltip": "",
       "url": "/d/orderflow-services",
-      "icon": "dashboard"
+      "tags": [],
+      "asDropdown": false,
+      "placement": "inControlsMenu",
+      "targetBlank": false,
+      "includeVars": false,
+      "keepTime": false
     },
     {
       "title": "Messaging",
       "type": "link",
+      "icon": "dashboard",
+      "tooltip": "",
       "url": "/d/orderflow-messaging",
-      "icon": "dashboard"
+      "tags": [],
+      "asDropdown": false,
+      "placement": "inControlsMenu",
+      "targetBlank": false,
+      "includeVars": false,
+      "keepTime": false
     },
     {
       "title": "Logs",
       "type": "link",
+      "icon": "dashboard",
+      "tooltip": "",
       "url": "/d/orderflow-logs",
-      "icon": "dashboard"
-    }
-  ],
-  "panels": [
-    {
-      "type": "timeseries",
-      "title": "Log lines by level",
-      "description": "",
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "expr": "sum by (level) (count_over_time({service=~\"$service\", level=~\".+\"}[1m]))",
-          "legendFormat": "{{level}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "color": {
-            "mode": "palette-classic"
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 1,
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 0
-      },
-      "datasource": {
-        "type": "loki",
-        "uid": "loki"
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Errors by service",
-      "description": "ERROR records per minute. Find the cause in the logs below by request_id or open the trace.",
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "expr": "sum by (service) (count_over_time({service=~\"$service\", level=\"ERROR\"}[1m]))",
-          "legendFormat": "{{service}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "color": {
-            "mode": "palette-classic"
-          },
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 2,
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
-      },
-      "datasource": {
-        "type": "loki",
-        "uid": "loki"
-      }
-    },
-    {
-      "type": "logs",
-      "title": "Logs",
-      "description": "Enter a request ID above to see one order's whole flow across all services. Expand a record and use the trace_id link to open its trace in Tempo.",
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "expr": "{service=~\"$service\"} | request_id=~\"$request_id.*\"",
-          "legendFormat": "__auto",
-          "queryType": "range"
-        }
-      ],
-      "options": {
-        "showTime": true,
-        "wrapLogMessage": true,
-        "sortOrder": "Descending",
-        "enableLogDetails": true,
-        "dedupStrategy": "none",
-        "prettifyLogMessage": false
-      },
-      "id": 3,
-      "gridPos": {
-        "h": 16,
-        "w": 24,
-        "x": 0,
-        "y": 8
-      },
-      "datasource": {
-        "type": "loki",
-        "uid": "loki"
-      }
+      "tags": [],
+      "asDropdown": false,
+      "placement": "inControlsMenu",
+      "targetBlank": false,
+      "includeVars": false,
+      "keepTime": false
     }
   ]
 }

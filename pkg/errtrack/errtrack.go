@@ -40,7 +40,7 @@ func Init(service string, cfg Config, log *slog.Logger) (flush func(), err error
 		Release:          cfg.Release,
 		ServerName:       service,
 		AttachStacktrace: true,
-		SendDefaultPII:   false, // no client IPs or request bodies in reports
+		// Personal data (client IPs, request bodies, cookies) is not sent by default.
 	})
 	if err != nil {
 		return nil, err

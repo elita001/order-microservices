@@ -124,7 +124,7 @@ func (c *Consumer) Run(ctx context.Context, handler Handler) error {
 		connected, err := c.consume(ctx, handler)
 		if ctx.Err() != nil {
 			c.log.Info("consumer stopped")
-			return nil
+			return nil //nolint:nilerr // shutting down: err is a consequence of the cancellation
 		}
 		if errors.Is(err, errPaused) {
 			delay = initialBackoff

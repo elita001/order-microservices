@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same branch cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0 # keep in sync with GOLANGCI_LINT_VERSION in the Makefile
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+
+  integration:
+    runs-on: ubuntu-latest # has Docker, which testcontainers needs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Integration tests (PostgreSQL, RabbitMQ)
+        run: go test -tags integration -race -count=1 ./...
+
+  # Dashboards are code: the committed JSON must be exactly what cmd/dashboards generates.
+  dashboards:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Regenerate dashboards
+        run: go run ./cmd/dashboards
+      - name: Check that the committed dashboards are up to date
+        run: |
+          if ! git diff --exit-code -- deploy/grafana/dashboards; then
+            echo "::error::Dashboards are out of date: run 'make dashboards' and commit the JSON files."
+            exit 1
+          fi
+
+  config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker Compose file
+        run: docker compose --env-file .env.example config --quiet
+      - name: Prometheus configuration and alert rules
+        run: >
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/etc/prometheus:ro"
+          prom/prometheus:v3.5.0 check config /etc/prometheus/prometheus.yml
+      - name: Alloy configuration
+        run: >
+          docker run --rm -e COMPOSE_PROJECT=ci -v "$PWD/deploy/alloy:/etc/alloy:ro"
+          grafana/alloy:v1.10.2 fmt /etc/alloy/config.alloy
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [gateway, order, payment, delivery, notification]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the ${{ matrix.service }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: SERVICE=${{ matrix.service }}
+          tags: orderflow/${{ matrix.service }}:ci
+          push: false
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}

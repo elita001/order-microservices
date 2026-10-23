@@ -66,7 +66,7 @@ func (m *Mailer) Send(ctx context.Context, email application.Email) (err error) 
 		return fmt.Errorf("set sender: %w", err)
 	}
 	if err := msg.To(email.To); err != nil {
-		return fmt.Errorf("%w: %v", application.ErrInvalidRecipient, err)
+		return fmt.Errorf("%w: %w", application.ErrInvalidRecipient, err)
 	}
 	msg.Subject(email.Subject)
 	msg.SetDate()

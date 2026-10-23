@@ -27,7 +27,7 @@ func Connect(ctx context.Context, dsn string, log *slog.Logger) (*pgxpool.Pool, 
 	}
 
 	// Every query becomes a span of the current trace.
-	cfg.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTrimSQLInSpanName())
+	cfg.ConnConfig.Tracer = otelpgx.NewTracer()
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

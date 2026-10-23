@@ -1,0 +1,41 @@
+# golangci-lint v2 configuration. Run: make lint (the same version runs in CI).
+version: "2"
+
+run:
+  timeout: 5m
+  build-tags: [integration] # lint the integration tests too
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose     # HTTP response bodies are closed
+    - errorlint     # errors are compared with errors.Is/As, so wrapping does not break checks
+    - gocritic
+    - gosec         # common security mistakes
+    - misspell
+    - nilerr        # returning nil after checking an error
+    - noctx         # HTTP requests and SQL queries carry a context
+    - rowserrcheck  # rows.Err() is checked
+    - sqlclosecheck # rows and statements are closed
+    - unconvert
+    - usestdlibvars # http.MethodGet instead of "GET", etc.
+  settings:
+    gosec:
+      excludes:
+        - G115 # integer conversions: we convert bounded values (counts, durations)
+  exclusions:
+    presets: [comments, common-false-positives, std-error-handling]
+    rules:
+      - path: _test\.go
+        linters: [gosec, noctx, bodyclose]
+      # The classic dashboard schema is deprecated in the SDK, but Grafana 12 provisions it
+      # from files (the v2 schema is behind a feature flag). See cmd/dashboards.
+      - path: cmd/dashboards/
+        linters: [staticcheck]
+        text: SA1019
+
+formatters:
+  enable: [gofmt, goimports]
+  settings:
+    goimports:
+      local-prefixes: [github.com/elita001/order-microservices]

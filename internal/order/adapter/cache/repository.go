@@ -129,7 +129,7 @@ func (r *Repository) get(ctx context.Context, id uuid.UUID) (*domain.Order, bool
 	defer cancel()
 
 	raw, err := r.rdb.Get(ctx, keyPrefix+id.String()).Result()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		requests.WithLabelValues("miss").Inc()
 		return nil, false
 	}
@@ -174,7 +174,7 @@ func (r *Repository) store(ctx context.Context, id uuid.UUID, version time.Time,
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), r.timeout)
 	defer cancel()
 
-	ttl := r.cfg.TTL + time.Duration(rand.Int64N(int64(r.cfg.TTL)/10+1))
+	ttl := r.cfg.TTL + time.Duration(rand.Int64N(int64(r.cfg.TTL)/10+1)) //nolint:gosec // jitter, not security
 	err := setIfNewer.Run(ctx, r.rdb, []string{keyPrefix + id.String()},
 		strconv.FormatInt(version.UnixMicro(), 10), payload, ttl.Milliseconds()).Err()
 	if err != nil {

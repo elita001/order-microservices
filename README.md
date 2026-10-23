@@ -1,40 +1,95 @@
 # OrderFlow
 
-A microservices system for placing and processing orders, written in Go.
+[![CI](https://github.com/elita001/order-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/elita001/order-microservices/actions/workflows/ci.yml)
+![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)
 
-## Services
+An order processing system of five Go microservices, built as a production-style portfolio
+project: event-driven, fault-tolerant, and observable end to end. One `make up` starts the
+whole system with its infrastructure and monitoring.
 
-| Service              | Status    | Description                    |
-|----------------------|-----------|--------------------------------|
-| API Gateway          | ✅ Step 5 | the single entry point: request IDs, rate limiting, idempotency, timeouts |
-| Order Service        | ✅ Step 6 | create, retrieve, and list orders; tracks order status from payment and delivery events; caches orders in Redis |
-| Payment Service      | ✅ Step 3 | charges orders through a payment provider stub, publishes the result |
-| Delivery Service     | ✅ Step 4 | hands paid orders over to a carrier stub, publishes the tracking number |
-| Notification Service | ✅ Step 4 | emails customers about every order step (Mailpit in development) |
+## Highlights
 
-## How it works
+- **Transactional outbox.** Business data and events are committed in one transaction; a
+  relay publishes them with publisher confirms, so an event exists if and only if the change does.
+- **Idempotency everywhere.** `Idempotency-Key` in the gateway (Redis) backed by a unique key
+  in the database; consumers are idempotent by business keys, so at-least-once delivery
+  never charges, ships, or emails twice.
+- **Failure handling.** Retries with backoff through retry queues, dead letter queues with an
+  inspect/replay tool, circuit breakers, fail-open Redis, consumers that pause while their
+  database is down, and `503` instead of `500` for outages.
+- **Cache-aside without stale writes.** Versioned entries and a Lua compare-and-set close the
+  classic invalidation race; `singleflight` prevents stampedes.
+- **End-to-end correlation.** One request ID and one OpenTelemetry trace follow an order across
+  HTTP and RabbitMQ, through the outbox, to every service's logs and spans.
+- **Observability as code.** Prometheus metrics and alert rules, Grafana dashboards generated
+  with the Grafana Foundation SDK, logs in Loki, traces in Tempo, errors in GlitchTip.
+- **Tested against real dependencies.** Unit tests, integration tests with testcontainers
+  (PostgreSQL, RabbitMQ), golangci-lint, and GitHub Actions CI.
 
+**Stack:** Go 1.27 · PostgreSQL 16 · RabbitMQ 4 (quorum queues) · Redis 7 · Docker Compose ·
+Prometheus · Grafana · Loki · Tempo · Grafana Alloy · OpenTelemetry · GlitchTip (Sentry SDK)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    client([Client]) -->|HTTP| gateway[API Gateway]
+    gateway -->|rate limits, idempotency keys| redis[(Redis)]
+    gateway -->|HTTP| order[Order Service]
+    order -->|order cache| redis
+
+    order -- order.created --> mq{{RabbitMQ}}
+    mq -- order.created --> payment[Payment Service]
+    payment -- "payment.succeeded / failed" --> mq
+    mq -- payment.succeeded --> delivery[Delivery Service]
+    delivery -- delivery.created --> mq
+    mq -- "payment.*, delivery.created" --> order
+    mq -- all events --> notification[Notification Service]
+
+    payment --> provider[/Payment provider stub/]
+    delivery --> carrier[/Carrier stub/]
+    notification -->|SMTP| mailpit[/Mailpit/]
+
+    order & payment & delivery & notification --> pg[(PostgreSQL)]
 ```
-client ──▶ API Gateway ──▶ Order Service ─── order.created ───▶ Payment Service ──▶ payment provider stub
-             │ Redis
-                              ▲   ▲                                │
-                              │   └──── payment.succeeded/failed ◀─┤
-                              │                                    ▼
-                              └──────── delivery.created ◀──── Delivery Service ──▶ carrier stub
 
-             all events ──▶ Notification Service ──SMTP──▶ Mailpit (customer emails)
+| Service              | Responsibility |
+|----------------------|----------------|
+| API Gateway          | the single entry point: request IDs, rate limiting, idempotency, timeouts |
+| Order Service        | creates, retrieves, and lists orders; tracks their status from events; caches orders in Redis |
+| Payment Service      | charges orders through a payment provider stub, publishes the result |
+| Delivery Service     | hands paid orders over to a carrier stub, publishes the tracking number |
+| Notification Service | emails customers about every order step (Mailpit in development) |
+
+The life of an order:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant G as Gateway
+    participant O as Order
+    participant MQ as RabbitMQ
+    participant P as Payment
+    participant D as Delivery
+    participant N as Notification
+
+    C->>G: POST /api/v1/orders (Idempotency-Key)
+    G->>O: forward with X-Request-Id and traceparent
+    O->>O: save the order and order.created in one transaction
+    O-->>C: 201 Created (pending)
+    O->>MQ: the outbox relay publishes order.created
+    MQ->>P: order.created
+    MQ->>N: order.created: "order received" email
+    P->>P: charge the provider, save the payment and payment.succeeded
+    P->>MQ: payment.succeeded
+    MQ->>O: order becomes paid
+    MQ->>D: register a parcel with the carrier
+    MQ->>N: "payment received" email
+    D->>MQ: delivery.created (tracking number)
+    MQ->>O: order becomes shipped
+    MQ->>N: "order shipped" email
 ```
-
-1. The API gateway checks the rate limit and the `Idempotency-Key` in Redis and forwards
-   the request; Order Service saves the order (`pending`) and the `order.created` event
-   in one transaction.
-2. Payment Service consumes `order.created`, charges the customer through the provider
-   stub, and saves the payment and `payment.succeeded` or `payment.failed` in one transaction.
-3. Order Service moves the order to `paid` or `payment_failed`.
-4. Delivery Service consumes `payment.succeeded`, registers a parcel with the carrier stub,
-   and publishes `delivery.created` with the tracking number; the order becomes `shipped`.
-5. Notification Service emails the customer on each step: order received, payment received
-   or failed, order shipped.
 
 Order statuses: `pending` → `paid` → `shipped`, or `pending` → `payment_failed`.
 
@@ -77,7 +132,10 @@ Useful commands:
 | `make orders`   | latest orders with their payment, shipment, and sent emails |
 | `make outbox`   | latest outbox messages of all services and their delivery state |
 | `make test`     | unit tests with the race detector                    |
-| `make dashboards` | regenerate the Grafana dashboards after editing `deploy/grafana/dashboards.py` |
+| `make test-integration` | integration tests with real PostgreSQL and RabbitMQ (needs Docker) |
+| `make lint`     | golangci-lint, the same version as in CI             |
+| `make check`    | everything CI checks: lint, unit and integration tests |
+| `make dashboards` | regenerate the Grafana dashboards after editing `cmd/dashboards` |
 | `make dlq-list queue=payment-service`   | show dead-lettered messages with their errors |
 | `make dlq-replay queue=payment-service` | move dead-lettered messages back for processing |
 
@@ -322,8 +380,10 @@ Prometheus adapter, so the use cases do not depend on the metrics library.
 - **Messaging:** dead-lettered messages, outbox lag, paused consumers, retries, consumer
   throughput and latency, queue depth.
 
-The JSON files are generated by `deploy/grafana/dashboards.py`: edit the panels there and run
-`make dashboards`. Counts over a time range use `increase()`, which extrapolates, so they are
+The JSON files are generated by `cmd/dashboards` with the
+[Grafana Foundation SDK](https://github.com/grafana/grafana-foundation-sdk): typed Go builders
+instead of hand-written JSON. Edit the panels there and run `make dashboards`; CI fails if the
+committed JSON differs from the generator's output. Counts over a time range use `increase()`, which extrapolates, so they are
 approximate; exact numbers come from the database. Prometheus runs with
 `created-timestamp-zero-ingestion`, so counters that appear with a non-zero value (e.g., right
 after a service starts) are not undercounted.
@@ -412,6 +472,28 @@ Then open the Logs dashboard with that request ID, and the `trace_id` link of an
 
 Like real providers, the payment and carrier stubs are idempotent: the outcome (decline,
 tracking number) is derived from the idempotency key, so a retry gets the same result.
+
+## Testing and quality
+
+| Level | What it covers | Run |
+|-------|----------------|-----|
+| Unit tests | use cases with fakes, HTTP and messaging adapters, the gateway with a real HTTP upstream and an in-memory Redis (miniredis), the cache and its Lua script, circuit breakers, header propagation | `make test` |
+| Integration tests | real PostgreSQL and RabbitMQ in containers (testcontainers): SQL and constraints, concurrent duplicates on unique indexes (one payment, one email), and the full path outbox → relay → RabbitMQ → consumer → retry queue → DLQ, keeping the request ID and the trace | `make test-integration` |
+| Static analysis | golangci-lint: the standard linters plus error wrapping, closed rows and bodies, contexts in requests, gosec | `make lint` |
+
+Integration tests carry the `integration` build tag, so `go test ./...` stays fast and needs
+no Docker. They start the containers once per package and isolate tests by random IDs.
+
+**CI** (GitHub Actions, `.github/workflows/ci.yml`) runs on every push and pull request:
+
+| Job | Checks |
+|-----|--------|
+| `lint` | golangci-lint |
+| `test` | `go vet`, unit tests with the race detector |
+| `integration` | integration tests (Docker is available on GitHub runners) |
+| `dashboards` | the committed dashboard JSON matches `cmd/dashboards` |
+| `config` | Docker Compose file, Prometheus config and alert rules (`promtool`), Alloy config |
+| `build` | Docker images of all five services |
 
 ## Configuration
 
@@ -519,10 +601,13 @@ pkg/events/                              integration event contracts shared betw
 pkg/redisclient/                         Redis client with fail-fast timeouts and a circuit breaker
 pkg/breaker/                             circuit breakers for dependencies
 cmd/dlq/                                 tool to inspect and replay dead letter queues
+cmd/dashboards/                          Grafana dashboards as code (Grafana Foundation SDK)
+internal/testkit/                        testcontainers setup for integration tests
+.github/workflows/                       CI pipeline
 internal/<service>/adapter/metrics/      business metrics (Prometheus adapter of the Metrics port)
 pkg/metrics/                             /metrics handler and HTTP RED middleware
 deploy/prometheus/                       scrape configuration and alert rules
-deploy/grafana/                          data sources, dashboards, and their generator
+deploy/grafana/                          data sources and the generated dashboards
 deploy/loki/, deploy/tempo/              log and trace storage configuration
 deploy/alloy/                            telemetry agent: container logs to Loki, OTLP traces to Tempo
 deploy/glitchtip/                        bootstrap of the error tracker (admin, project, DSN key)

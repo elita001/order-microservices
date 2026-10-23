@@ -3,7 +3,7 @@
 RABBITMQ_URL ?= amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@localhost:$(or $(RABBITMQ_PORT),5672)/
 SERVICE_QUEUES = order-service payment-service delivery-service notification-service
 
-.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards
+.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards lint test-integration check
 
 up: .env      ## build and start everything
 	docker compose up -d --build --remove-orphans
@@ -37,8 +37,19 @@ orders:        ## show the latest orders with their payment, shipment, and notif
 		LEFT JOIN shipments s ON s.order_id = o.id \
 		ORDER BY o.created_at DESC LIMIT 20"'
 
-test:
+GOLANGCI_LINT_VERSION = v2.14.0
+
+test:          ## unit tests (fast, no Docker)
 	go test -race -count=1 ./...
+
+test-integration: ## integration tests with real PostgreSQL and RabbitMQ (testcontainers, needs Docker)
+	go test -tags integration -race -count=1 ./...
+
+lint:          ## golangci-lint in Docker, the same version as in CI
+	docker run --rm -v $(CURDIR):/app -v $(HOME)/go/pkg/mod:/go/pkg/mod -w /app \
+		golangci/golangci-lint:$(GOLANGCI_LINT_VERSION) golangci-lint run
+
+check: lint test test-integration ## everything CI checks, locally
 
 tidy:
 	go mod tidy
@@ -57,6 +68,6 @@ rabbitmq-reset-queues: ## DEVELOPMENT ONLY: delete the service queues (and their
 	for q in $(SERVICE_QUEUES); do docker compose exec rabbitmq rabbitmqctl delete_queue $$q; done
 	docker compose restart order payment delivery notification
 
-dashboards:    ## regenerate Grafana dashboards from deploy/grafana/dashboards.py
-	python3 deploy/grafana/dashboards.py
+dashboards:    ## regenerate Grafana dashboards from cmd/dashboards (Grafana Foundation SDK)
+	go run ./cmd/dashboards
 	docker compose restart grafana
