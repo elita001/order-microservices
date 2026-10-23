@@ -1,0 +1,158 @@
+# Unit tests of the alert rules: `make test-alerts` (promtool test rules). CI runs them too.
+# Each case feeds synthetic time series and checks which alerts fire, with their labels
+# and rendered annotations. Series values: "a+bxN" means a, a+b, ..., N+1 samples, one per interval.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------- HighErrorRate ----------
+  - name: errors at low traffic do not alert
+    interval: 1m
+    input_series:
+      # 2 requests per minute, half of them fail: 50% errors, but only 10 requests per 5 minutes.
+      - series: 'http_requests_total{job="order", status="200"}'
+        values: '0+1x20'
+      - series: 'http_requests_total{job="order", status="500"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HighErrorRate
+        exp_alerts: []
+
+  - name: errors at real traffic alert
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="order", status="200"}'
+        values: '0+90x20'
+      - series: 'http_requests_total{job="order", status="500"}'
+        values: '0+10x20'
+    alert_rule_test:
+      - eval_time: 4m # condition true, but "for: 5m" has not passed yet
+        alertname: HighErrorRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: HighErrorRate
+        exp_alerts:
+          - exp_labels: {severity: warning, job: order}
+            exp_annotations:
+              summary: "order: 10% of requests fail with 5xx"
+
+  # ---------- SlowRequests ----------
+  - name: a few slow requests do not alert
+    interval: 1m
+    input_series:
+      - series: 'http_request_duration_seconds_bucket{job="gateway", le="0.5"}'
+        values: '0+0x20'
+      - series: 'http_request_duration_seconds_bucket{job="gateway", le="2.5"}'
+        values: '0+1x20'
+      - series: 'http_request_duration_seconds_bucket{job="gateway", le="+Inf"}'
+        values: '0+1x20'
+      - series: 'http_request_duration_seconds_count{job="gateway"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SlowRequests
+        exp_alerts: []
+
+  - name: slow p95 at real traffic alerts
+    interval: 1m
+    input_series:
+      # 100 requests per minute, 95% of them slower than 1s.
+      - series: 'http_request_duration_seconds_bucket{job="gateway", le="0.5"}'
+        values: '0+2x20'
+      - series: 'http_request_duration_seconds_bucket{job="gateway", le="1"}'
+        values: '0+3x20'
+      - series: 'http_request_duration_seconds_bucket{job="gateway", le="2.5"}'
+        values: '0+100x20'
+      - series: 'http_request_duration_seconds_bucket{job="gateway", le="+Inf"}'
+        values: '0+100x20'
+      - series: 'http_request_duration_seconds_count{job="gateway"}'
+        values: '0+100x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: SlowRequests
+        exp_alerts:
+          # The 95th request falls into the (1s, 2.5s] bucket: 1 + 1.5 * (95 - 3) / 97 = 2.423s.
+          - exp_labels: {severity: warning, job: gateway}
+            exp_annotations:
+              summary: "gateway: p95 latency is 2.423s"
+
+  # ---------- HighPaymentDeclineRate ----------
+  - name: declines at low traffic do not alert
+    interval: 1m
+    input_series:
+      # One payment per minute, all declined: 100%, but only 15 payments per 15 minutes.
+      - series: 'payments_total{status="failed", reason="card_declined"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: HighPaymentDeclineRate
+        exp_alerts: []
+
+  - name: declines at real traffic alert
+    interval: 1m
+    input_series:
+      - series: 'payments_total{status="failed", reason="card_declined"}'
+        values: '0+3x40'
+      - series: 'payments_total{status="succeeded", reason=""}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: HighPaymentDeclineRate
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: "75% of payments are declined"
+
+  # ---------- Messaging ----------
+  - name: a dead-lettered message alerts with the commands to handle it
+    interval: 1m
+    input_series:
+      - series: 'rabbitmq_detailed_queue_messages{queue="payment-service.dlq"}'
+        values: '0 0 1 1 1 1'
+      - series: 'rabbitmq_detailed_queue_messages{queue="payment-service"}'
+        values: '5 5 5 5 5 5' # a non-empty service queue is normal
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DeadLetterQueueNotEmpty
+        exp_alerts:
+          - exp_labels: {severity: warning, queue: payment-service.dlq}
+            exp_annotations:
+              summary: "1 message(s) in payment-service.dlq"
+              description: "Inspect with `make dlq-list queue=payment-service`, fix the cause, then `make dlq-replay queue=payment-service`."
+
+  - name: outbox lag alerts only when it lasts
+    interval: 1m
+    input_series:
+      - series: 'outbox_oldest_pending_age_seconds{table="order_outbox"}'
+        values: '0 90 0 90 150 210 270 330'
+    alert_rule_test:
+      - eval_time: 2m # a short spike
+        alertname: OutboxLagging
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: OutboxLagging
+        exp_alerts:
+          - exp_labels: {severity: warning, table: order_outbox}
+            exp_annotations:
+              summary: "order_outbox: events are 5m 30s late"
+              description: "The outbox relay cannot publish: is RabbitMQ available?"
+
+  # ---------- Availability ----------
+  - name: a service that stops answering scrapes alerts
+    interval: 30s
+    input_series:
+      - series: 'up{job="payment"}'
+        values: '1 1 0 0 0 0'
+      - series: 'up{job="prometheus"}' # not one of our services
+        values: '0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m30s
+        alertname: ServiceDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: payment}
+            exp_annotations:
+              summary: "payment is down"
+              description: "Prometheus cannot scrape payment for 1 minute."

@@ -393,13 +393,18 @@ after a service starts) are not undercounted.
 | Alert | Fires when |
 |-------|------------|
 | `ServiceDown` | a service cannot be scraped for 1 minute |
-| `HighErrorRate` | more than 5% of a service's responses are 5xx for 5 minutes |
-| `SlowRequests` | p95 latency of a service is above 1s for 10 minutes |
+| `HighErrorRate` | more than 5% of a service's responses are 5xx for 5 minutes, with at least 50 requests per 5 minutes |
+| `SlowRequests` | p95 latency of a service is above 1s for 10 minutes, with at least 50 requests per 5 minutes |
 | `DeadLetterQueueNotEmpty` | a DLQ has messages; the description contains the `make dlq-list` command |
 | `OutboxLagging` | the oldest unpublished event is older than 60s (is RabbitMQ down?) |
 | `ConsumerPaused` | a consumer has been paused for 2 minutes (its database is down) |
 | `CircuitBreakerOpen` | a breaker has been open for 1 minute |
-| `HighPaymentDeclineRate` | more than half of the payments are declined for 10 minutes |
+| `HighPaymentDeclineRate` | more than half of the payments are declined for 10 minutes, with at least 20 payments per 15 minutes |
+
+Ratio alerts require a minimum volume: with two requests, one error is already 50%, which
+says nothing about the service. The rules have unit tests (`deploy/prometheus/alerts_test.yml`,
+`make test-alerts`, also run in CI): synthetic time series check, for example, that 50% errors
+at 2 requests per minute do not alert, while 10% errors at 100 requests per minute do.
 
 Delivering alerts to Slack or email needs Alertmanager, which is not part of the local setup.
 
@@ -479,6 +484,7 @@ tracking number) is derived from the idempotency key, so a retry gets the same r
 |-------|----------------|-----|
 | Unit tests | use cases with fakes, HTTP and messaging adapters, the gateway with a real HTTP upstream and an in-memory Redis (miniredis), the cache and its Lua script, circuit breakers, header propagation | `make test` |
 | Integration tests | real PostgreSQL and RabbitMQ in containers (testcontainers): SQL and constraints, concurrent duplicates on unique indexes (one payment, one email), and the full path outbox → relay → RabbitMQ → consumer → retry queue → DLQ, keeping the request ID and the trace | `make test-integration` |
+| Alert rules | `promtool test rules`: which alerts fire on synthetic series, with labels and annotations | `make test-alerts` |
 | Static analysis | golangci-lint: the standard linters plus error wrapping, closed rows and bodies, contexts in requests, gosec | `make lint` |
 
 Integration tests carry the `integration` build tag, so `go test ./...` stays fast and needs
@@ -492,7 +498,7 @@ no Docker. They start the containers once per package and isolate tests by rando
 | `test` | `go vet`, unit tests with the race detector |
 | `integration` | integration tests (Docker is available on GitHub runners) |
 | `dashboards` | the committed dashboard JSON matches `cmd/dashboards` |
-| `config` | Docker Compose file, Prometheus config and alert rules (`promtool`), Alloy config |
+| `config` | Docker Compose file, Prometheus config, alert rule unit tests (`promtool`), Alloy config |
 | `build` | Docker images of all five services |
 
 ## Configuration

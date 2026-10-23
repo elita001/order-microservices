@@ -3,7 +3,7 @@
 RABBITMQ_URL ?= amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@localhost:$(or $(RABBITMQ_PORT),5672)/
 SERVICE_QUEUES = order-service payment-service delivery-service notification-service
 
-.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards lint test-integration check
+.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards lint test-integration test-alerts check
 
 up: .env      ## build and start everything
 	docker compose up -d --build --remove-orphans
@@ -49,7 +49,11 @@ lint:          ## golangci-lint in Docker, the same version as in CI
 	docker run --rm -v $(CURDIR):/app -v $(HOME)/go/pkg/mod:/go/pkg/mod -w /app \
 		golangci/golangci-lint:$(GOLANGCI_LINT_VERSION) golangci-lint run
 
-check: lint test test-integration ## everything CI checks, locally
+test-alerts:   ## unit tests of the Prometheus alert rules (deploy/prometheus/alerts_test.yml)
+	docker run --rm --entrypoint promtool -v $(CURDIR)/deploy/prometheus:/etc/prometheus:ro -w /etc/prometheus \
+		prom/prometheus:v3.5.0 test rules alerts_test.yml
+
+check: lint test test-alerts test-integration ## everything CI checks, locally
 
 tidy:
 	go mod tidy

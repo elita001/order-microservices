@@ -74,6 +74,10 @@ jobs:
         run: >
           docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/etc/prometheus:ro"
           prom/prometheus:v3.5.0 check config /etc/prometheus/prometheus.yml
+      - name: Alert rule tests
+        run: >
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/etc/prometheus:ro" -w /etc/prometheus
+          prom/prometheus:v3.5.0 test rules alerts_test.yml
       - name: Alloy configuration
         run: >
           docker run --rm -e COMPOSE_PROJECT=ci -v "$PWD/deploy/alloy:/etc/alloy:ro"

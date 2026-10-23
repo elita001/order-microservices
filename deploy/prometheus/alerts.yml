@@ -1,5 +1,8 @@
 # Alert rules. They are visible in Prometheus (http://localhost:9090/alerts); routing them
 # to Slack or email would need Alertmanager, which is out of scope for local development.
+#
+# Ratio alerts also require a minimum volume: with 2 requests, one error is already 50%,
+# which says nothing about the service. Tests: alerts_test.yml (`make test-alerts`).
 groups:
   - name: orderflow-availability
     rules:
@@ -14,17 +17,24 @@ groups:
 
       - alert: HighErrorRate
         expr: |
-          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
-            / sum by (job) (rate(http_requests_total[5m])) > 0.05
+          (
+            sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+              / sum by (job) (rate(http_requests_total[5m])) > 0.05
+          )
+          and sum by (job) (increase(http_requests_total[5m])) >= 50
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "{{ $labels.job }}: {{ $value | humanizePercentage }} of requests fail with 5xx"
 
+      # p95 of a handful of requests is just the slowest one.
       - alert: SlowRequests
         expr: |
-          histogram_quantile(0.95, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m]))) > 1
+          (
+            histogram_quantile(0.95, sum by (le, job) (rate(http_request_duration_seconds_bucket[5m]))) > 1
+          )
+          and sum by (job) (increase(http_request_duration_seconds_count[5m])) >= 50
         for: 10m
         labels:
           severity: warning
@@ -75,7 +85,10 @@ groups:
     rules:
       - alert: HighPaymentDeclineRate
         expr: |
-          sum(rate(payments_total{status="failed"}[15m])) / sum(rate(payments_total[15m])) > 0.5
+          (
+            sum(rate(payments_total{status="failed"}[15m])) / sum(rate(payments_total[15m])) > 0.5
+          )
+          and sum(increase(payments_total[15m])) >= 20
         for: 10m
         labels:
           severity: warning
