@@ -23,8 +23,8 @@ type fakeRepo struct {
 	byKey    map[string]*domain.Order
 }
 
-func (f *fakeRepo) GetByIdempotencyKey(_ context.Context, key string) (*domain.Order, error) {
-	if order, ok := f.byKey[key]; ok {
+func (f *fakeRepo) GetByIdempotencyKey(_ context.Context, customerID uuid.UUID, key string) (*domain.Order, error) {
+	if order, ok := f.byKey[idemKey(customerID, key)]; ok {
 		return order, nil
 	}
 	return nil, domain.ErrNotFound
@@ -38,17 +38,21 @@ func (f *fakeRepo) Create(_ context.Context, order *domain.Order, events ...doma
 		if f.byKey == nil {
 			f.byKey = map[string]*domain.Order{}
 		}
-		if _, ok := f.byKey[order.IdempotencyKey]; ok {
+		// Like the unique (customer_id, idempotency_key) constraint.
+		if _, ok := f.byKey[idemKey(order.CustomerID, order.IdempotencyKey)]; ok {
 			return domain.ErrDuplicateIdempotencyKey
 		}
-		f.byKey[order.IdempotencyKey] = order
+		f.byKey[idemKey(order.CustomerID, order.IdempotencyKey)] = order
 	}
 	f.created = order
 	f.events = events
 	return f.err
 }
 
-func (f *fakeRepo) GetByID(_ context.Context, _ uuid.UUID) (*domain.Order, error) {
+func (f *fakeRepo) GetByID(_ context.Context, id uuid.UUID) (*domain.Order, error) {
+	if f.created != nil && f.created.ID == id {
+		return f.created, nil
+	}
 	return nil, domain.ErrNotFound
 }
 
@@ -68,6 +72,8 @@ func (f *fakeRepo) UpdateStatus(_ context.Context, id uuid.UUID, from []domain.S
 	f.statuses[id] = to
 	return true, nil
 }
+
+func idemKey(customerID uuid.UUID, key string) string { return customerID.String() + "|" + key }
 
 type discardLogger struct{}
 
@@ -168,8 +174,9 @@ func TestService_ListByCustomer_Limit(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := &fakeRepo{}
+			customer := uuid.New()
 			result, err := newTestService(repo).ListByCustomer(context.Background(),
-				ListOrdersInput{CustomerID: uuid.New(), Limit: tt.limit})
+				ListOrdersInput{Viewer: Viewer{CustomerID: customer}, CustomerID: customer, Limit: tt.limit})
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -313,7 +320,7 @@ func (r *racingRepo) Create(_ context.Context, order *domain.Order, _ ...domain.
 	winner := *order
 	winner.ID = uuid.New()
 	r.winner = &winner
-	r.byKey = map[string]*domain.Order{order.IdempotencyKey: &winner}
+	r.byKey = map[string]*domain.Order{idemKey(order.CustomerID, order.IdempotencyKey): &winner}
 	return domain.ErrDuplicateIdempotencyKey
 }
 
@@ -328,5 +335,83 @@ func TestService_Create_ConcurrentDuplicateReturnsWinner(t *testing.T) {
 	}
 	if !result.Replayed || result.Order.ID != repo.winner.ID {
 		t.Errorf("result = %+v, want the concurrently created order", result)
+	}
+}
+
+func TestService_Get_OnlyOwnOrdersUnlessSupport(t *testing.T) {
+	repo := &fakeRepo{}
+	svc := newTestService(repo)
+	in := validInput()
+	created, err := svc.Create(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.Order.ID
+
+	if _, err := svc.Get(context.Background(), Viewer{CustomerID: in.CustomerID}, id); err != nil {
+		t.Errorf("owner: %v", err)
+	}
+	// Another customer's order looks like a missing one: its existence is not revealed.
+	if _, err := svc.Get(context.Background(), Viewer{CustomerID: uuid.New()}, id); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("another customer: got %v, want ErrNotFound", err)
+	}
+	if _, err := svc.Get(context.Background(), Viewer{CustomerID: uuid.New(), SeeAll: true}, id); err != nil {
+		t.Errorf("support: %v", err)
+	}
+}
+
+func TestService_ListByCustomer_Authorization(t *testing.T) {
+	me, someone := uuid.New(), uuid.New()
+	tests := []struct {
+		name    string
+		in      ListOrdersInput
+		wantErr error
+		wantFor uuid.UUID
+	}{
+		{"own orders by default", ListOrdersInput{Viewer: Viewer{CustomerID: me}}, nil, me},
+		{"another customer's orders", ListOrdersInput{Viewer: Viewer{CustomerID: me}, CustomerID: someone}, domain.ErrForbidden, uuid.Nil},
+		{"support lists any customer", ListOrdersInput{Viewer: Viewer{CustomerID: me, SeeAll: true}, CustomerID: someone}, nil, someone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &listRecorder{}
+			_, err := newTestService(repo).ListByCustomer(context.Background(), tt.in)
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("got %v, want %v", err, tt.wantErr)
+			}
+			if repo.customer != tt.wantFor {
+				t.Errorf("listed orders of %s, want %s", repo.customer, tt.wantFor)
+			}
+		})
+	}
+}
+
+type listRecorder struct {
+	fakeRepo
+	customer uuid.UUID
+}
+
+func (r *listRecorder) ListByCustomer(_ context.Context, customerID uuid.UUID, _, _ int) ([]domain.Order, error) {
+	r.customer = customerID
+	return nil, nil
+}
+
+// Idempotency keys belong to a customer: another customer with the same key and body
+// creates their own order instead of getting someone else's.
+func TestService_Create_IdempotencyKeyIsPerCustomer(t *testing.T) {
+	svc := newTestService(&fakeRepo{})
+	first, second := validInput(), validInput() // different customers
+	first.IdempotencyKey, second.IdempotencyKey = "same-key", "same-key"
+
+	a, err := svc.Create(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.Create(context.Background(), second)
+	if err != nil {
+		t.Fatalf("second customer: %v", err)
+	}
+	if b.Replayed || a.Order.ID == b.Order.ID {
+		t.Error("the second customer must get a new order, not a replay of the first one's")
 	}
 }

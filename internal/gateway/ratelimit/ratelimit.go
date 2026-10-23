@@ -13,6 +13,7 @@ import (
 	"github.com/go-redis/redis_rate/v10"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -44,7 +45,7 @@ func (l *Limiter) Middleware(policy Policy) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := "ratelimit:" + policy.Name + ":" + clientIP(r)
+			key := "ratelimit:" + policy.Name + ":" + client(r)
 			ctx, cancel := context.WithTimeout(r.Context(), l.timeout)
 			res, err := l.limiter.Allow(ctx, key, limit)
 			cancel()
@@ -70,6 +71,16 @@ func (l *Limiter) Middleware(policy Policy) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// client identifies who is limited: the authenticated user, so users behind one NAT or
+// office proxy do not share a limit, and one user cannot bypass it by changing IPs.
+// Unauthenticated requests are limited by IP.
+func client(r *http.Request) string {
+	if p, ok := auth.FromContext(r.Context()); ok {
+		return "user:" + p.UserID.String()
+	}
+	return "ip:" + clientIP(r)
 }
 
 // clientIP uses the TCP peer address: the gateway is the edge of the system. Behind a

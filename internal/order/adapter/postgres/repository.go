@@ -20,7 +20,7 @@ import (
 const OutboxTable = "order_outbox"
 
 const (
-	idempotencyKeyConstraint = "orders_idempotency_key_key"
+	idempotencyKeyConstraint = "orders_customer_idempotency_key_key"
 	uniqueViolation          = "23505"
 )
 
@@ -104,9 +104,9 @@ func (r *Repository) GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, 
 	return &order, nil
 }
 
-func (r *Repository) GetByIdempotencyKey(ctx context.Context, key string) (*domain.Order, error) {
+func (r *Repository) GetByIdempotencyKey(ctx context.Context, customerID uuid.UUID, key string) (*domain.Order, error) {
 	var id uuid.UUID
-	err := r.pool.QueryRow(ctx, `SELECT id FROM orders WHERE idempotency_key = $1`, key).Scan(&id)
+	err := r.pool.QueryRow(ctx, `SELECT id FROM orders WHERE customer_id = $1 AND idempotency_key = $2`, customerID, key).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrNotFound
 	}

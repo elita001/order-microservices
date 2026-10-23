@@ -1,0 +1,76 @@
+{
+  "realm": "orderflow",
+  "displayName": "OrderFlow",
+  "enabled": true,
+  "sslRequired": "none",
+  "accessTokenLifespan": 900,
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      { "name": "customer", "description": "Places orders and sees only their own orders" },
+      { "name": "support", "description": "Sees the orders of every customer" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "orderflow-cli",
+      "name": "OrderFlow CLI and tests",
+      "description": "Public client for local development: password grant for curl and tests. A browser app would use the authorization code flow with PKCE instead.",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "redirectUris": ["http://localhost:*"],
+      "webOrigins": ["+"],
+      "attributes": { "pkce.code.challenge.method": "S256" },
+      "protocolMappers": [
+        {
+          "name": "orderflow-api audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "orderflow-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "a11ce000-0000-4000-8000-000000000001",
+      "username": "alice",
+      "email": "alice@example.com",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Customer",
+      "enabled": true,
+      "credentials": [{ "type": "password", "value": "alice", "temporary": false }],
+      "realmRoles": ["customer"]
+    },
+    {
+      "id": "b0b00000-0000-4000-8000-000000000002",
+      "username": "bob",
+      "email": "bob@example.com",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Customer",
+      "enabled": true,
+      "credentials": [{ "type": "password", "value": "bob", "temporary": false }],
+      "realmRoles": ["customer"]
+    },
+    {
+      "id": "5a990000-0000-4000-8000-000000000003",
+      "username": "support",
+      "email": "support@example.com",
+      "emailVerified": true,
+      "firstName": "Sam",
+      "lastName": "Support",
+      "enabled": true,
+      "credentials": [{ "type": "password", "value": "support", "temporary": false }],
+      "realmRoles": ["support"]
+    }
+  ]
+}

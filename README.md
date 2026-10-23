@@ -9,6 +9,8 @@ whole system with its infrastructure and monitoring.
 
 ## Highlights
 
+- **Authentication with zero trust.** OAuth 2.0 / OpenID Connect with Keycloak: the gateway
+  and each service verify the access token themselves; customers see only their own orders.
 - **Transactional outbox.** Business data and events are committed in one transaction; a
   relay publishes them with publisher confirms, so an event exists if and only if the change does.
 - **Idempotency everywhere.** `Idempotency-Key` in the gateway (Redis) backed by a unique key
@@ -26,14 +28,17 @@ whole system with its infrastructure and monitoring.
 - **Tested against real dependencies.** Unit tests, integration tests with testcontainers
   (PostgreSQL, RabbitMQ), golangci-lint, and GitHub Actions CI.
 
-**Stack:** Go 1.27 · PostgreSQL 16 · RabbitMQ 4 (quorum queues) · Redis 7 · Docker Compose ·
+**Stack:** Go 1.27 · PostgreSQL 16 · RabbitMQ 4 (quorum queues) · Redis 7 · Keycloak 26 · Docker Compose ·
 Prometheus · Grafana · Loki · Tempo · Grafana Alloy · OpenTelemetry · GlitchTip (Sentry SDK)
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    client([Client]) -->|HTTP| gateway[API Gateway]
+    client([Client]) -->|login| keycloak[Keycloak]
+    client -->|HTTP + access token| gateway[API Gateway]
+    gateway -. signing keys .-> keycloak
+    order -. signing keys .-> keycloak
     gateway -->|rate limits, idempotency keys| redis[(Redis)]
     gateway -->|HTTP| order[Order Service]
     order -->|order cache| redis
@@ -74,8 +79,10 @@ sequenceDiagram
     participant D as Delivery
     participant N as Notification
 
-    C->>G: POST /api/v1/orders (Idempotency-Key)
-    G->>O: forward with X-Request-Id and traceparent
+    C->>G: POST /api/v1/orders (Bearer token, Idempotency-Key)
+    G->>G: verify the token, rate limit per user
+    G->>O: forward with the token, X-Request-Id, and traceparent
+    O->>O: verify the token again, customer = token subject
     O->>O: save the order and order.created in one transaction
     O-->>C: 201 Created (pending)
     O->>MQ: the outbox relay publishes order.created
@@ -117,6 +124,7 @@ Clients use the API gateway at http://localhost:8080. The services' own ports
 
 Management UIs:
 
+- Keycloak (identity provider; admin / `KEYCLOAK_ADMIN_PASSWORD`): http://localhost:8180
 - RabbitMQ: http://localhost:15672 (credentials `RABBITMQ_USER` / `RABBITMQ_PASSWORD` from `.env`, `app` / `app` by default)
 - Mailpit (all emails sent by the system): http://localhost:8025
 - Grafana (dashboards, no login needed to view; admin / `GRAFANA_ADMIN_PASSWORD`): http://localhost:3000
@@ -131,6 +139,7 @@ Useful commands:
 | `make logs`     | follow the logs of all application services          |
 | `make orders`   | latest orders with their payment, shipment, and sent emails |
 | `make outbox`   | latest outbox messages of all services and their delivery state |
+| `make token user=alice` | print an access token of a test user |
 | `make test`     | unit tests with the race detector                    |
 | `make test-integration` | integration tests with real PostgreSQL and RabbitMQ (needs Docker) |
 | `make lint`     | golangci-lint, the same version as in CI             |
@@ -141,32 +150,78 @@ Useful commands:
 
 ## Example requests
 
+Every API call needs an access token. Get one for a test user (valid for 15 minutes):
+
+```bash
+TOKEN=$(make -s token user=alice)
+```
+
 ```bash
 curl -s -X POST 'localhost:8080/api/v1/orders' \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{
-    "customer_id": "7b0c8a3e-2f1d-4e5a-9b6c-1d2e3f4a5b6c",
     "currency": "RUB",
     "items": [{"product_id": "book-42", "quantity": 2, "price": 59900}]
   }'
 ```
+
+The order belongs to the authenticated user: there is no `customer_id` in the request.
 
 The order is created as `pending`. A second or two later it becomes `shipped` or
 `payment_failed` (by default the payment stub declines ~20% of payments), and the
 emails appear in Mailpit:
 
 ```bash
-curl -s 'localhost:8080/api/v1/orders/<id>'
+curl -s 'localhost:8080/api/v1/orders/<id>' -H "Authorization: Bearer $TOKEN"
 ```
 
-List a customer's orders:
+List your orders (`support` may add `customer_id=<id>` to see another customer's orders):
 
 ```bash
-curl -s 'localhost:8080/api/v1/orders?customer_id=<customer-id>&limit=20&offset=0'
+curl -s 'localhost:8080/api/v1/orders?limit=20&offset=0' -H "Authorization: Bearer $TOKEN"
 ```
 
 Amounts are stored in the currency's smallest units (kopecks): `59900` = RUB 599.00.
+
+## Authentication and authorization
+
+Clients log in to **Keycloak** (OAuth 2.0 / OpenID Connect) and call the API with the access
+token (a JWT signed by Keycloak). The realm, its roles, client, and test users are imported
+from `deploy/keycloak/orderflow-realm.json` on startup.
+
+| User | Password | Role | May |
+|------|----------|------|-----|
+| `alice`, `bob` | same as the user name | `customer` | place orders, see and list their own orders |
+| `support` | `support` | `support` | see and list the orders of every customer |
+
+**Zero trust.** The gateway verifies the token and rejects bad requests early (`401`). Order
+Service verifies the same token again and takes the customer from its `sub` claim. It never
+trusts identity headers such as `X-User-Id`: its port can be reached directly (it is even
+published for debugging), and such a header could be set by anyone. A verifier checks the
+signature (keys from Keycloak's JWKS, cached and refreshed on key rotation), the issuer, the
+audience (`orderflow-api`, so a token issued for another API is rejected), and the expiry.
+
+**Authorization rules** live in the use cases, not in the HTTP layer:
+
+- the customer of a new order is the token's user; a `customer_id` in the body is rejected;
+- another customer's order is reported as `404`, not `403`, so its existence is not revealed;
+- listing another customer's orders is `403` for customers and allowed for `support`.
+
+Identity also scopes the gateway's protections: **rate limits are per user** (users behind one
+NAT do not share a limit, and changing IPs does not bypass it), and **idempotency keys are per
+customer**, in Redis and in the database (`UNIQUE (customer_id, idempotency_key)`): another
+customer with the same key and body gets their own order, never someone else's response.
+
+**Issuer and keys.** Tokens are issued by the public URL `http://localhost:8180/realms/orderflow`
+(`OIDC_ISSUER`), while the services fetch the keys over the internal network from
+`http://keycloak:8080/...` (`OIDC_JWKS_URL`). `KC_HOSTNAME` makes Keycloak put the public
+issuer into every token, however it was reached.
+
+For local development the `orderflow-cli` client allows the password grant, so tokens can be
+fetched with curl (`make token`). A browser application would use the authorization code
+flow with PKCE instead, and service-to-service calls would use client credentials.
 
 ## API Gateway
 
@@ -224,7 +279,7 @@ so the use cases do not know about it.
   (`singleflight`).
 - **Fail-open.** Redis errors are logged and the database is used; every Redis call is
   bounded by `REDIS_OPERATION_TIMEOUT`.
-- Lists (`GET /orders?customer_id=`) are not cached: they change with every new order, and
+- Lists (`GET /orders`) are not cached: they change with every new order, and
   invalidating them correctly costs more than the query, which uses an index.
 
 ## Events
@@ -460,7 +515,8 @@ Try it:
 
 ```bash
 curl -s -i -X POST localhost:8080/api/v1/orders -H 'Content-Type: application/json' \
-  -d '{"customer_id":"7b0c8a3e-2f1d-4e5a-9b6c-1d2e3f4a5b6c","currency":"RUB","items":[{"product_id":"book-42","quantity":1,"price":59900}]}' \
+  -H "Authorization: Bearer $(make -s token user=alice)" \
+  -d '{"currency":"RUB","items":[{"product_id":"book-42","quantity":1,"price":59900}]}' \
   | grep -i x-request-id
 ```
 
@@ -482,7 +538,7 @@ tracking number) is derived from the idempotency key, so a retry gets the same r
 
 | Level | What it covers | Run |
 |-------|----------------|-----|
-| Unit tests | use cases with fakes, HTTP and messaging adapters, the gateway with a real HTTP upstream and an in-memory Redis (miniredis), the cache and its Lua script, circuit breakers, header propagation | `make test` |
+| Unit tests | authorization rules, token verification against a fake identity provider (real RSA signatures: expired, foreign key, wrong issuer or audience), use cases with fakes, HTTP and messaging adapters, the gateway with a real HTTP upstream and an in-memory Redis (miniredis), the cache and its Lua script, circuit breakers, header propagation | `make test` |
 | Integration tests | real PostgreSQL and RabbitMQ in containers (testcontainers): SQL and constraints, concurrent duplicates on unique indexes (one payment, one email), and the full path outbox → relay → RabbitMQ → consumer → retry queue → DLQ, keeping the request ID and the trace | `make test-integration` |
 | Alert rules | `promtool test rules`: which alerts fire on synthetic series, with labels and annotations | `make test-alerts` |
 | Static analysis | golangci-lint: the standard linters plus error wrapping, closed rows and bodies, contexts in requests, gosec | `make lint` |
@@ -511,6 +567,14 @@ Telemetry (all Go services):
 | `OTEL_TRACES_SAMPLER_RATIO`    | `1`     | share of traces kept (the caller's decision wins)   |
 | `SENTRY_DSN`                   | — (reporting off) | GlitchTip or Sentry DSN                   |
 | `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE` | `development`, — | tags of error reports              |
+
+Authentication (gateway and Order Service):
+
+| Variable         | Default | Description |
+|------------------|---------|-------------|
+| `OIDC_ISSUER`    | — (required) | expected `iss` of access tokens: the public realm URL |
+| `OIDC_JWKS_URL`  | — (required) | where the signing keys are fetched (internal URL) |
+| `OIDC_AUDIENCE`  | `orderflow-api` | required `aud` of access tokens |
 
 API gateway:
 
@@ -605,6 +669,7 @@ pkg/outbox/                              transactional outbox: storing messages 
 pkg/rabbitmq/                            RabbitMQ connection, publisher with confirms, consumer
 pkg/events/                              integration event contracts shared between services
 pkg/redisclient/                         Redis client with fail-fast timeouts and a circuit breaker
+pkg/auth/                                access token verification, principal in context, test identity provider
 pkg/breaker/                             circuit breakers for dependencies
 cmd/dlq/                                 tool to inspect and replay dead letter queues
 cmd/dashboards/                          Grafana dashboards as code (Grafana Foundation SDK)
@@ -614,6 +679,7 @@ internal/<service>/adapter/metrics/      business metrics (Prometheus adapter of
 pkg/metrics/                             /metrics handler and HTTP RED middleware
 deploy/prometheus/                       scrape configuration and alert rules
 deploy/grafana/                          data sources and the generated dashboards
+deploy/keycloak/                         realm with roles, client, and test users
 deploy/loki/, deploy/tempo/              log and trace storage configuration
 deploy/alloy/                            telemetry agent: container logs to Loki, OTLP traces to Tempo
 deploy/glitchtip/                        bootstrap of the error tracker (admin, project, DSN key)

@@ -16,6 +16,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -86,7 +87,12 @@ func (s *Store) Middleware(next http.Handler) http.Handler {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		fingerprint := fingerprintOf(r, body)
+		// Keys are chosen by each client independently, so they are scoped by user: another
+		// user with the same key and body must not get this user's stored response.
 		redisKey := "idempotency:" + key
+		if p, ok := auth.FromContext(r.Context()); ok {
+			redisKey = "idempotency:" + p.UserID.String() + ":" + key
+		}
 		log := logger.FromContext(r.Context())
 
 		lock, _ := json.Marshal(record{State: stateProcessing, Fingerprint: fingerprint})

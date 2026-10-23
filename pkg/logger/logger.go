@@ -1,13 +1,15 @@
 // Package logger configures structured JSON logging and passes a logger through context.
 //
 // Every record logged with a context (InfoContext and friends) gets request_id, trace_id,
-// and span_id from it, so logs can be correlated across services and with traces.
+// span_id, and the attributes added with WithAttrs (e.g., user_id) from it, so logs can be
+// correlated across services and with traces.
 package logger
 
 import (
 	"context"
 	"log/slog"
 	"os"
+	"slices"
 
 	"go.opentelemetry.io/otel/trace"
 
@@ -32,8 +34,20 @@ func WithCorrelation(ctx context.Context, l *slog.Logger) *slog.Logger {
 	return l
 }
 
+type attrsKey struct{}
+
+// WithAttrs adds attributes to every record logged with the returned context. Middleware
+// uses it for request-scoped facts, such as the authenticated user.
+func WithAttrs(ctx context.Context, args ...any) context.Context {
+	existing, _ := ctx.Value(attrsKey{}).([]any)
+	return context.WithValue(ctx, attrsKey{}, append(slices.Clip(existing), args...))
+}
+
 func correlation(ctx context.Context) []any {
 	var attrs []any
+	if extra, ok := ctx.Value(attrsKey{}).([]any); ok {
+		attrs = append(attrs, extra...)
+	}
 	if id := requestid.FromContext(ctx); id != "" {
 		attrs = append(attrs, "request_id", id)
 	}

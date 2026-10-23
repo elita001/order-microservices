@@ -21,6 +21,7 @@ import (
 	ordermetrics "github.com/elita001/order-microservices/internal/order/adapter/metrics"
 	orderpostgres "github.com/elita001/order-microservices/internal/order/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/order/application"
+	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
@@ -55,6 +56,7 @@ type config struct {
 	Consumer rabbitmq.ConsumerConfig `envPrefix:"CONSUMER_"`
 	Redis    redisclient.Config      `envPrefix:"REDIS_"`
 	Cache    ordercache.Config       `envPrefix:"CACHE_"`
+	Auth     auth.Config             `envPrefix:"OIDC_"`
 }
 
 func main() {
@@ -132,8 +134,11 @@ func run() error {
 	// Internal port: Prometheus scrapes it directly, clients never reach it.
 	r.Handle("/metrics", metrics.Handler())
 	httpx.RegisterHealth(r, pool.Ping)
+	// The service verifies the access token itself instead of trusting the gateway: its port
+	// can be reached directly, and identity must not come from headers a caller can set.
+	verifier := auth.NewVerifier(ctx, cfg.Auth)
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Use(httpx.Timeout(cfg.RequestTimeout))
+		r.Use(httpx.Timeout(cfg.RequestTimeout), auth.Middleware(verifier, nil))
 		httpHandler.Register(r)
 	})
 

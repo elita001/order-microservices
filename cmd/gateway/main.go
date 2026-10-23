@@ -18,6 +18,7 @@ import (
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
 	"github.com/elita001/order-microservices/internal/gateway/proxy"
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
+	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -47,6 +48,7 @@ type config struct {
 	Redis       redisclient.Config `envPrefix:"REDIS_"`
 	Upstream    proxy.Config       `envPrefix:"UPSTREAM_"`
 	Idempotency idempotency.Config `envPrefix:"IDEMPOTENCY_"`
+	Auth        auth.Config        `envPrefix:"OIDC_"`
 }
 
 func main() {
@@ -109,6 +111,7 @@ func run() error {
 		WriteLimit:      ratelimit.Policy{Name: "write", Rate: cfg.WriteRateLimit, Burst: cfg.WriteRateBurst},
 		Idempotency:     cfg.Idempotency,
 		RedisTimeout:    cfg.Redis.OperationTimeout,
+		Verifier:        auth.NewVerifier(ctx, cfg.Auth),
 	}, rdb, log)
 
 	srv := &http.Server{

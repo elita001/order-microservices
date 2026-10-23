@@ -18,6 +18,13 @@ x-telemetry-env: &telemetry-env
   SENTRY_DSN: ${SENTRY_DSN:-http://${GLITCHTIP_DSN_KEY}@glitchtip:8000/1}
   SENTRY_ENVIRONMENT: development
 
+# Access token verification (the gateway and every service with an API). The issuer is the
+# public URL clients get tokens from; the keys are fetched over the internal network.
+x-auth-env: &auth-env
+  OIDC_ISSUER: "http://localhost:${KEYCLOAK_PORT:-8180}/realms/orderflow"
+  OIDC_JWKS_URL: "http://keycloak:8080/realms/orderflow/protocol/openid-connect/certs"
+  OIDC_AUDIENCE: orderflow-api
+
 # Settings shared by the services that consume events.
 x-consumer-env: &consumer-env
   <<: *telemetry-env
@@ -95,6 +102,33 @@ services:
       timeout: 3s
       retries: 10
 
+  # Identity provider: issues the access tokens (OAuth 2.0 / OpenID Connect). The realm with
+  # its roles, client, and test users is imported from deploy/keycloak on startup.
+  # Development mode keeps data in memory: the realm is re-imported on every start.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?copy .env.example to .env}
+      # Tokens carry this issuer however Keycloak is reached (browser, curl, or the
+      # services over the internal network), so it matches the services' OIDC_ISSUER.
+      KC_HOSTNAME: "http://localhost:${KEYCLOAK_PORT:-8180}"
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "${KEYCLOAK_PORT:-8180}:8080"
+    healthcheck:
+      # The image has no curl or wget: bash talks HTTP to the management port directly.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && grep -q UP <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
   # Fake SMTP server: catches all emails and shows them in a web UI.
   mailpit:
     image: axllent/mailpit:v1.27
@@ -150,7 +184,7 @@ services:
       args:
         SERVICE: gateway
     environment:
-      <<: *telemetry-env
+      <<: [*telemetry-env, *auth-env]
       HTTP_ADDR: ":8080"
       LOG_LEVEL: ${LOG_LEVEL:-info}
       ORDER_SERVICE_URL: "http://order:8081"
@@ -182,7 +216,7 @@ services:
       args:
         SERVICE: order
     environment:
-      <<: *consumer-env
+      <<: [*consumer-env, *auth-env]
       HTTP_ADDR: ":8081"
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
       CACHE_TTL: ${ORDER_CACHE_TTL:-5m}

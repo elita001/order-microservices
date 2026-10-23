@@ -3,7 +3,7 @@
 RABBITMQ_URL ?= amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@localhost:$(or $(RABBITMQ_PORT),5672)/
 SERVICE_QUEUES = order-service payment-service delivery-service notification-service
 
-.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards lint test-integration test-alerts check
+.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards lint test-integration test-alerts check token
 
 up: .env      ## build and start everything
 	docker compose up -d --build --remove-orphans
@@ -75,3 +75,8 @@ rabbitmq-reset-queues: ## DEVELOPMENT ONLY: delete the service queues (and their
 dashboards:    ## regenerate Grafana dashboards from cmd/dashboards (Grafana Foundation SDK)
 	go run ./cmd/dashboards
 	docker compose restart grafana
+
+token:         ## print an access token for API calls: make token user=alice (alice, bob: customers; support)
+	@curl -s -X POST http://localhost:$(or $(KEYCLOAK_PORT),8180)/realms/orderflow/protocol/openid-connect/token \
+		-d grant_type=password -d client_id=orderflow-cli -d username=$(or $(user),alice) -d password=$(or $(user),alice) \
+		| python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("access_token") or d)'

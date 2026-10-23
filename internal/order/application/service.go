@@ -32,8 +32,8 @@ type Repository interface {
 	// so an event is published if and only if the order is saved.
 	Create(ctx context.Context, order *domain.Order, events ...domain.Event) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.Order, error)
-	// GetByIdempotencyKey returns domain.ErrNotFound if no order has this key.
-	GetByIdempotencyKey(ctx context.Context, key string) (*domain.Order, error)
+	// GetByIdempotencyKey returns domain.ErrNotFound if the customer has no order with this key.
+	GetByIdempotencyKey(ctx context.Context, customerID uuid.UUID, key string) (*domain.Order, error)
 	ListByCustomer(ctx context.Context, customerID uuid.UUID, limit, offset int) ([]domain.Order, error)
 	// UpdateStatus changes the status only if the order is currently in one of the from
 	// statuses and reports whether it was changed.
@@ -79,6 +79,18 @@ type noopMetrics struct{}
 func (noopMetrics) OrderCreated(string)              {}
 func (noopMetrics) OrderStatusChanged(domain.Status) {}
 
+// Viewer is who reads orders: a customer sees only their own, support sees all.
+type Viewer struct {
+	CustomerID uuid.UUID
+	SeeAll     bool
+}
+
+func (v Viewer) canSee(customerID uuid.UUID) bool {
+	return v.SeeAll || v.CustomerID == customerID
+}
+
+// CreateOrderInput comes from an authenticated request: CustomerID is the user from the
+// access token, never a value from the request body.
 type CreateOrderInput struct {
 	CustomerID     uuid.UUID
 	Currency       string
@@ -94,7 +106,8 @@ type CreateOrderResult struct {
 }
 
 type ListOrdersInput struct {
-	CustomerID uuid.UUID
+	Viewer     Viewer
+	CustomerID uuid.UUID // optional: the viewer's own orders by default
 	Limit      int
 	Offset     int
 }
@@ -120,7 +133,7 @@ func (s *Service) Create(ctx context.Context, in CreateOrderInput) (*CreateOrder
 
 	hash := requestHash(in)
 	if in.IdempotencyKey != "" {
-		result, err := s.replay(ctx, in.IdempotencyKey, hash)
+		result, err := s.replay(ctx, in.CustomerID, in.IdempotencyKey, hash)
 		if result != nil || err != nil {
 			return result, err
 		}
@@ -149,7 +162,7 @@ func (s *Service) Create(ctx context.Context, in CreateOrderInput) (*CreateOrder
 	err := s.repo.Create(ctx, order, domain.NewOrderCreated(order))
 	if errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
 		// A concurrent request with the same key has created the order first.
-		result, err := s.replay(ctx, in.IdempotencyKey, hash)
+		result, err := s.replay(ctx, in.CustomerID, in.IdempotencyKey, hash)
 		if result == nil && err == nil {
 			err = fmt.Errorf("order with idempotency key %q disappeared", in.IdempotencyKey)
 		}
@@ -169,9 +182,10 @@ func (s *Service) Create(ctx context.Context, in CreateOrderInput) (*CreateOrder
 	return &CreateOrderResult{Order: order}, nil
 }
 
-// replay returns the order created earlier with the same idempotency key, or nil if there is none.
-func (s *Service) replay(ctx context.Context, key, hash string) (*CreateOrderResult, error) {
-	existing, err := s.repo.GetByIdempotencyKey(ctx, key)
+// replay returns the order the customer created earlier with the same idempotency key,
+// or nil if there is none.
+func (s *Service) replay(ctx context.Context, customerID uuid.UUID, key, hash string) (*CreateOrderResult, error) {
+	existing, err := s.repo.GetByIdempotencyKey(ctx, customerID, key)
 	if errors.Is(err, domain.ErrNotFound) {
 		return nil, nil
 	}
@@ -195,17 +209,26 @@ func requestHash(in CreateOrderInput) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (s *Service) Get(ctx context.Context, id uuid.UUID) (*domain.Order, error) {
+// Get returns the order if the viewer may see it. Another customer's order is reported
+// as not found rather than forbidden, so its existence is not revealed.
+func (s *Service) Get(ctx context.Context, viewer Viewer, id uuid.UUID) (*domain.Order, error) {
 	order, err := s.repo.GetByID(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("get order %s: %w", id, err)
 	}
+	if !viewer.canSee(order.CustomerID) {
+		return nil, fmt.Errorf("get order %s: %w", id, domain.ErrNotFound)
+	}
 	return order, nil
 }
 
+// ListByCustomer lists the viewer's orders, or any customer's orders for support.
 func (s *Service) ListByCustomer(ctx context.Context, in ListOrdersInput) (*ListOrdersResult, error) {
 	if in.CustomerID == uuid.Nil {
-		return nil, &domain.ValidationError{Field: "customer_id", Message: "is required"}
+		in.CustomerID = in.Viewer.CustomerID
+	}
+	if !in.Viewer.canSee(in.CustomerID) {
+		return nil, domain.ErrForbidden
 	}
 	if in.Offset < 0 {
 		return nil, &domain.ValidationError{Field: "offset", Message: "must not be negative"}

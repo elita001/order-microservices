@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,15 +18,21 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/google/uuid"
+
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
 	"github.com/elita001/order-microservices/internal/gateway/proxy"
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
+	"github.com/elita001/order-microservices/pkg/auth"
+	"github.com/elita001/order-microservices/pkg/auth/authtest"
 	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/redisclient"
 )
 
 type testEnv struct {
+	idp       *authtest.IDP
+	token     string // a valid token of the default test user
 	gateway   *httptest.Server
 	redis     *miniredis.Miniredis
 	calls     atomic.Int32
@@ -36,7 +43,8 @@ type testEnv struct {
 // 201 to POST, or the status from the X-Test-Status header, after X-Test-Delay.
 func newTestEnv(t *testing.T, writeLimit ratelimit.Policy) *testEnv {
 	t.Helper()
-	env := &testEnv{redis: miniredis.RunT(t)}
+	env := &testEnv{redis: miniredis.RunT(t), idp: authtest.NewIDP(t)}
+	env.token = env.idp.Customer(t, uuid.New())
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		env.calls.Add(1)
@@ -65,6 +73,7 @@ func newTestEnv(t *testing.T, writeLimit ratelimit.Policy) *testEnv {
 		WriteLimit:      writeLimit,
 		Idempotency:     idempotency.Config{TTL: time.Hour, LockTTL: 10 * time.Second},
 		RedisTimeout:    100 * time.Millisecond,
+		Verifier:        auth.NewVerifier(context.Background(), env.idp.Config),
 	}, rdb, slog.New(slog.DiscardHandler))
 	env.gateway = httptest.NewServer(router)
 	t.Cleanup(env.gateway.Close)
@@ -97,6 +106,7 @@ func (env *testEnv) post(t *testing.T, key, body string, headers map[string]stri
 	if key != "" {
 		req.Header.Set(httpx.IdempotencyKeyHeader, key)
 	}
+	req.Header.Set("Authorization", "Bearer "+env.token) // headers may override or clear it
 	for name, value := range headers {
 		req.Header.Set(name, value)
 	}
@@ -210,7 +220,9 @@ func TestProxy_UpstreamTimeout(t *testing.T) {
 
 func TestProxy_UpstreamUnavailable(t *testing.T) {
 	target, _ := url.Parse("http://127.0.0.1:1") // nothing listens on port 1
+	idp := authtest.NewIDP(t)
 	router := NewRouter(Config{
+		Verifier:        auth.NewVerifier(context.Background(), idp.Config),
 		OrderServiceURL: target,
 		Upstream:        proxy.Config{DialTimeout: time.Second, Timeout: time.Second},
 		ReadLimit:       ratelimit.Policy{Name: "read", Rate: 100, Burst: 100},
@@ -219,7 +231,9 @@ func TestProxy_UpstreamUnavailable(t *testing.T) {
 	}, newRedisClient(t, miniredis.RunT(t).Addr()), slog.New(slog.DiscardHandler))
 
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/orders/123", nil))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/orders/123", nil)
+	req.Header.Set("Authorization", "Bearer "+idp.Customer(t, uuid.New()))
+	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("got %d, want 502", rec.Code)
 	}
@@ -257,5 +271,53 @@ func TestRedisHangingFailsOpenQuickly(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Errorf("request took %v with a hanging Redis, want well under 1s", elapsed)
+	}
+}
+
+func TestAuth_RequestsWithoutValidTokenAreRejected(t *testing.T) {
+	env := newTestEnv(t, generousLimit)
+
+	for name, header := range map[string]string{
+		"no token":      "",
+		"invalid token": "Bearer not-a-jwt",
+		"expired token": "Bearer " + env.idp.Sign(t, authtest.Token{Subject: uuid.New(), ExpiresIn: -time.Minute}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp, _ := env.post(t, "", `{}`, map[string]string{"Authorization": header})
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Errorf("got %d, want 401", resp.StatusCode)
+			}
+		})
+	}
+	if calls := env.calls.Load(); calls != 0 {
+		t.Errorf("upstream called %d times: unauthenticated requests must not reach the services", calls)
+	}
+}
+
+// Each user has their own budget: one user hitting the limit does not block another.
+func TestRateLimit_PerUser(t *testing.T) {
+	env := newTestEnv(t, ratelimit.Policy{Name: "write", Rate: 1, Burst: 1})
+	other := map[string]string{"Authorization": "Bearer " + env.idp.Customer(t, uuid.New())}
+
+	first, _ := env.post(t, "", `{}`, nil)
+	limited, _ := env.post(t, "", `{}`, nil)
+	otherUser, _ := env.post(t, "", `{}`, other)
+	if first.StatusCode != http.StatusCreated || limited.StatusCode != http.StatusTooManyRequests || otherUser.StatusCode != http.StatusCreated {
+		t.Errorf("statuses = %d, %d, %d; want 201, 429, 201", first.StatusCode, limited.StatusCode, otherUser.StatusCode)
+	}
+}
+
+// Another user with the same Idempotency-Key and body must not get this user's response.
+func TestIdempotency_KeysArePerUser(t *testing.T) {
+	env := newTestEnv(t, generousLimit)
+	other := map[string]string{"Authorization": "Bearer " + env.idp.Customer(t, uuid.New())}
+
+	env.post(t, "shared-key", `{"a":1}`, nil)
+	resp, _ := env.post(t, "shared-key", `{"a":1}`, other)
+	if resp.Header.Get(httpx.IdempotentReplayedHeader) != "" {
+		t.Fatal("another user got a replayed response")
+	}
+	if calls := env.calls.Load(); calls != 2 {
+		t.Errorf("upstream called %d times, want 2", calls)
 	}
 }

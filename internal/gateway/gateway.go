@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
 	"github.com/elita001/order-microservices/internal/gateway/proxy"
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
+	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/metrics"
 	"github.com/elita001/order-microservices/pkg/telemetry"
@@ -27,7 +30,15 @@ type Config struct {
 	WriteLimit      ratelimit.Policy // POST requests
 	Idempotency     idempotency.Config
 	RedisTimeout    time.Duration // per Redis call; Redis failures are tolerated (fail-open)
+	// Verifier checks access tokens. The gateway rejects unauthenticated requests early;
+	// the services verify the token again and never trust identity from headers.
+	Verifier *auth.Verifier
 }
+
+var authFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "gateway_auth_failures_total",
+	Help: "Requests rejected with 401, by reason: missing_token or invalid_token.",
+}, []string{"reason"})
 
 func NewRouter(cfg Config, rdb *redis.Client, log *slog.Logger) http.Handler {
 	limiter := ratelimit.New(rdb, cfg.RedisTimeout)
@@ -43,6 +54,8 @@ func NewRouter(cfg Config, rdb *redis.Client, log *slog.Logger) http.Handler {
 	httpx.RegisterHealth(r, func(context.Context) error { return nil })
 
 	r.Route("/api/v1/orders", func(r chi.Router) {
+		// Authentication comes first: rate limits and idempotency keys are per user.
+		r.Use(auth.Middleware(cfg.Verifier, func(reason string) { authFailures.WithLabelValues(reason).Inc() }))
 		r.With(limiter.Middleware(cfg.WriteLimit), idempotent.Middleware).Post("/", orders.ServeHTTP)
 		r.With(limiter.Middleware(cfg.ReadLimit)).Get("/", orders.ServeHTTP)
 		r.With(limiter.Middleware(cfg.ReadLimit)).Get("/{id}", orders.ServeHTTP)

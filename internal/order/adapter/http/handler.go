@@ -14,6 +14,7 @@ import (
 
 	"github.com/elita001/order-microservices/internal/order/application"
 	"github.com/elita001/order-microservices/internal/order/domain"
+	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/errtrack"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -22,7 +23,7 @@ import (
 
 type Service interface {
 	Create(ctx context.Context, in application.CreateOrderInput) (*application.CreateOrderResult, error)
-	Get(ctx context.Context, id uuid.UUID) (*domain.Order, error)
+	Get(ctx context.Context, viewer application.Viewer, id uuid.UUID) (*domain.Order, error)
 	ListByCustomer(ctx context.Context, in application.ListOrdersInput) (*application.ListOrdersResult, error)
 }
 
@@ -46,10 +47,11 @@ type itemDTO struct {
 	Price     int64  `json:"price"`
 }
 
+// createOrderRequest has no customer_id: the customer is the authenticated user. A body
+// with customer_id is rejected (unknown field), so old clients fail loudly, not silently.
 type createOrderRequest struct {
-	CustomerID string    `json:"customer_id"`
-	Currency   string    `json:"currency"`
-	Items      []itemDTO `json:"items"`
+	Currency string    `json:"currency"`
+	Items    []itemDTO `json:"items"`
 }
 
 type orderResponse struct {
@@ -84,19 +86,14 @@ func (h *Handler) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	customerID, err := uuid.Parse(req.CustomerID)
-	if err != nil {
-		h.handleError(w, r, &domain.ValidationError{Field: "customer_id", Message: "must be a valid UUID"})
-		return
-	}
-
+	principal := mustPrincipal(r)
 	items := make([]domain.Item, 0, len(req.Items))
 	for _, item := range req.Items {
 		items = append(items, domain.Item{ProductID: item.ProductID, Quantity: item.Quantity, Price: item.Price})
 	}
 
 	result, err := h.service.Create(r.Context(), application.CreateOrderInput{
-		CustomerID:     customerID,
+		CustomerID:     principal.UserID,
 		Currency:       req.Currency,
 		Items:          items,
 		IdempotencyKey: r.Header.Get(httpx.IdempotencyKeyHeader),
@@ -120,7 +117,7 @@ func (h *Handler) getOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order, err := h.service.Get(r.Context(), id)
+	order, err := h.service.Get(r.Context(), viewer(r), id)
 	if err != nil {
 		h.handleError(w, r, err)
 		return
@@ -130,10 +127,13 @@ func (h *Handler) getOrder(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) listOrders(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	customerID, err := uuid.Parse(q.Get("customer_id"))
-	if err != nil {
-		h.handleError(w, r, &domain.ValidationError{Field: "customer_id", Message: "must be a valid UUID"})
-		return
+	var customerID uuid.UUID // the viewer's own orders by default; support may pass any customer
+	if raw := q.Get("customer_id"); raw != "" {
+		var err error
+		if customerID, err = uuid.Parse(raw); err != nil {
+			h.handleError(w, r, &domain.ValidationError{Field: "customer_id", Message: "must be a valid UUID"})
+			return
+		}
 	}
 	limit, err := queryInt(q, "limit")
 	if err != nil {
@@ -147,6 +147,7 @@ func (h *Handler) listOrders(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := h.service.ListByCustomer(r.Context(), application.ListOrdersInput{
+		Viewer:     viewer(r),
 		CustomerID: customerID,
 		Limit:      limit,
 		Offset:     offset,
@@ -165,6 +166,8 @@ func (h *Handler) handleError(w http.ResponseWriter, r *http.Request, err error)
 		httpx.WriteError(w, http.StatusUnprocessableEntity, "validation_error", validationErr.Error())
 	case errors.Is(err, domain.ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, "not_found", "order not found")
+	case errors.Is(err, domain.ErrForbidden):
+		httpx.WriteError(w, http.StatusForbidden, "forbidden", "access to another customer's orders is denied")
 	case errors.Is(err, domain.ErrIdempotencyKeyReused):
 		httpx.WriteError(w, http.StatusUnprocessableEntity, "idempotency_key_reused", err.Error())
 	case postgres.IsUnavailable(err):
@@ -177,6 +180,20 @@ func (h *Handler) handleError(w http.ResponseWriter, r *http.Request, err error)
 		errtrack.CaptureError(r.Context(), err, nil) // unexpected: needs a human
 		httpx.WriteError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 	}
+}
+
+// mustPrincipal returns the authenticated user; the routes are behind auth.Middleware.
+func mustPrincipal(r *http.Request) auth.Principal {
+	p, ok := auth.FromContext(r.Context())
+	if !ok {
+		panic("order handler is not behind auth.Middleware") // a wiring bug, not a client error
+	}
+	return p
+}
+
+func viewer(r *http.Request) application.Viewer {
+	p := mustPrincipal(r)
+	return application.Viewer{CustomerID: p.UserID, SeeAll: p.HasRole(auth.RoleSupport)}
 }
 
 func toResponse(order *domain.Order) orderResponse {

@@ -35,3 +35,23 @@ func TestContextHandlerAddsCorrelationIDs(t *testing.T) {
 		t.Errorf("a record without context must not get correlation IDs: %s", buf.String())
 	}
 }
+
+func TestWithAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(contextHandler{slog.NewJSONHandler(&buf, nil)})
+	ctx := WithAttrs(context.Background(), "user_id", "u-1")
+	ctx2 := WithAttrs(ctx, "tenant", "t-1")
+
+	log.InfoContext(ctx2, "both")
+	log.InfoContext(ctx, "first only") // the parent context is not changed by the child
+	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	var both, first map[string]any
+	_ = json.Unmarshal(lines[0], &both)
+	_ = json.Unmarshal(lines[1], &first)
+	if both["user_id"] != "u-1" || both["tenant"] != "t-1" {
+		t.Errorf("record = %v", both)
+	}
+	if first["user_id"] != "u-1" || first["tenant"] != nil {
+		t.Errorf("record = %v", first)
+	}
+}

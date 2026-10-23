@@ -43,6 +43,9 @@ type Order struct {
 
 var ErrNotFound = errors.New("order not found")
 
+// ErrForbidden means the viewer may not access another customer's data.
+var ErrForbidden = errors.New("access denied")
+
 // ErrDuplicateIdempotencyKey is returned by the repository when an order with the same
 // idempotency key already exists (e.g., created by a concurrent request).
 var ErrDuplicateIdempotencyKey = errors.New("order with this idempotency key already exists")

@@ -71,14 +71,21 @@ func TestRepository_DuplicateIdempotencyKey(t *testing.T) {
 	if err := repo.Create(ctx, first); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	err := repo.Create(ctx, newOrder(uuid.New(), key, time.Now()))
+	err := repo.Create(ctx, newOrder(first.CustomerID, key, time.Now()))
 	if !errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
 		t.Fatalf("second create with the same key: got %v, want ErrDuplicateIdempotencyKey", err)
 	}
 
-	got, err := repo.GetByIdempotencyKey(ctx, key)
+	got, err := repo.GetByIdempotencyKey(ctx, first.CustomerID, key)
 	if err != nil || got.ID != first.ID || got.RequestHash != first.RequestHash {
 		t.Fatalf("GetByIdempotencyKey = %+v, %v; want the first order", got, err)
+	}
+	// The same key of another customer is a different key.
+	if err := repo.Create(ctx, newOrder(uuid.New(), key, time.Now())); err != nil {
+		t.Fatalf("another customer with the same key: %v", err)
+	}
+	if _, err := repo.GetByIdempotencyKey(ctx, uuid.New(), key); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("another customer's lookup: got %v, want ErrNotFound", err)
 	}
 	// Orders without a key do not conflict with each other (NULLs are not equal).
 	for range 2 {
