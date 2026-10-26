@@ -15,14 +15,16 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/sync/errgroup"
 
+	orderv1 "github.com/elita001/order-microservices/gen/go/orderflow/order/v1"
 	ordercache "github.com/elita001/order-microservices/internal/order/adapter/cache"
-	orderhttp "github.com/elita001/order-microservices/internal/order/adapter/http"
+	ordergrpc "github.com/elita001/order-microservices/internal/order/adapter/grpc"
 	ordermessaging "github.com/elita001/order-microservices/internal/order/adapter/messaging"
 	ordermetrics "github.com/elita001/order-microservices/internal/order/adapter/metrics"
 	orderpostgres "github.com/elita001/order-microservices/internal/order/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/order/application"
 	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/errtrack"
+	"github.com/elita001/order-microservices/pkg/grpcx"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -37,6 +39,8 @@ import (
 const serviceName = "order-service"
 
 type config struct {
+	GRPCAddr string `env:"GRPC_ADDR" envDefault:":9081"` // the API (orderflow.order.v1.OrderService)
+	// HTTPAddr serves only health probes and metrics.
 	HTTPAddr        string        `env:"HTTP_ADDR" envDefault:":8081"`
 	PostgresDSN     string        `env:"POSTGRES_DSN,required"`
 	LogLevel        string        `env:"LOG_LEVEL" envDefault:"info"`
@@ -44,9 +48,11 @@ type config struct {
 
 	Telemetry telemetry.Config // OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_TRACES_SAMPLER_RATIO
 	ErrTrack  errtrack.Config  // SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_RELEASE
-	// Shorter than the gateway's UPSTREAM_TIMEOUT, so the service answers itself
-	// (503 if the database hangs) instead of the gateway answering 504.
+	// The longest a call may run, whatever deadline the caller sent. Callers usually send a
+	// shorter one (the gateway's ORDER_GRPC_TIMEOUT), which the server keeps.
 	RequestTimeout time.Duration `env:"REQUEST_TIMEOUT" envDefault:"3s"`
+	// Lets grpcurl list the API. Development only.
+	GRPCReflection bool `env:"GRPC_REFLECTION" envDefault:"false"`
 
 	RabbitMQURL      string `env:"RABBITMQ_URL,required"`
 	RabbitMQExchange string `env:"RABBITMQ_EXCHANGE" envDefault:"orderflow.events"`
@@ -120,7 +126,6 @@ func run() error {
 	// Cache-aside decorator: the application service does not know about the cache.
 	repo := ordercache.New(orderpostgres.NewRepository(pool), rdb, cfg.Cache, cfg.Redis.OperationTimeout, log)
 	svc := application.NewService(repo, log).WithMetrics(ordermetrics.Prometheus{})
-	httpHandler := orderhttp.NewHandler(svc)
 	eventHandler := ordermessaging.NewHandler(svc)
 
 	consumer := rabbitmq.NewConsumer(cfg.RabbitMQURL, serviceName, rabbitmq.Topology{
@@ -129,18 +134,22 @@ func run() error {
 		RoutingKeys: eventHandler.RoutingKeys(),
 	}, cfg.Consumer, log).WithHealthCheck(pool.Ping)
 
+	// The service verifies the access token itself instead of trusting the gateway: its port
+	// can be reached directly, and identity must not come from metadata a caller can set.
+	grpcSrv := grpcx.NewServer(grpcx.ServerOptions{
+		Logger:     log,
+		Verifier:   auth.NewVerifier(ctx, cfg.Auth),
+		Timeout:    cfg.RequestTimeout,
+		Reflection: cfg.GRPCReflection,
+	})
+	orderv1.RegisterOrderServiceServer(grpcSrv, ordergrpc.NewServer(svc))
+	health := grpcx.RegisterHealth(grpcSrv, pool.Ping, log)
+
+	// Internal port: Prometheus scrapes it directly, Docker probes it.
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, httpx.Logger(log), metrics.HTTP, telemetry.RouteName, httpx.Recoverer)
-	// Internal port: Prometheus scrapes it directly, clients never reach it.
 	r.Handle("/metrics", metrics.Handler())
 	httpx.RegisterHealth(r, pool.Ping)
-	// The service verifies the access token itself instead of trusting the gateway: its port
-	// can be reached directly, and identity must not come from headers a caller can set.
-	verifier := auth.NewVerifier(ctx, cfg.Auth)
-	r.Route("/api/v1", func(r chi.Router) {
-		r.Use(httpx.Timeout(cfg.RequestTimeout), auth.Middleware(verifier, nil))
-		httpHandler.Register(r)
-	})
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -153,6 +162,8 @@ func run() error {
 
 	// All components stop together: on a signal or when any of them fails.
 	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return grpcx.Serve(gctx, grpcSrv, cfg.GRPCAddr, cfg.ShutdownTimeout, log) })
+	g.Go(func() error { return health.Run(gctx) })
 	g.Go(func() error { return httpserver.Run(gctx, srv, cfg.ShutdownTimeout, log) })
 	g.Go(func() error { return relay.Run(gctx) })
 	g.Go(func() error { return consumer.Run(gctx, eventHandler.Handle) })

@@ -24,7 +24,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "up{job=~\"gateway|order|payment|delivery|notification\"}",
+          "expr": "up{job=~\"gateway|order|customer|payment|delivery|notification\"}",
           "instant": true,
           "legendFormat": "{{job}}",
           "range": false,
@@ -453,7 +453,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "round(sum by (job, method, route, status) (increase(http_requests_total{job=~\"gateway|order|payment|delivery|notification\"}[$__range]))) \u003e 0",
+          "expr": "round(sum by (job, method, route, status) (increase(http_requests_total{job=~\"gateway|order|customer|payment|delivery|notification\"}[$__range]))) \u003e 0",
           "format": "table",
           "instant": true,
           "legendFormat": "__auto",
@@ -515,12 +515,420 @@
     {
       "type": "row",
       "collapsed": false,
-      "title": "Gateway, cache, circuit breakers",
+      "title": "gRPC: order and customer services",
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
         "y": 28
+      },
+      "id": 0,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (grpc_method, grpc_code) (rate(grpc_server_handled_total{grpc_service!=\"grpc.health.v1.Health\"}[1m]))",
+          "legendFormat": "{{grpc_method}} {{grpc_code}}",
+          "refId": "A"
+        }
+      ],
+      "title": "gRPC calls by method and code",
+      "description": "Calls the servers handled. NotFound, InvalidArgument, PermissionDenied are answers to bad calls, not failures.",
+      "transparent": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 29
+      },
+      "repeatDirection": "h",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "(sum by (job) (rate(grpc_server_handled_total{grpc_code=~\"Unknown|Internal|Unavailable|DeadlineExceeded|DataLoss\"}[5m])) or sum by (job) (rate(grpc_server_handled_total[5m])) * 0) / sum by (job) (rate(grpc_server_handled_total[5m]))",
+          "legendFormat": "{{job}}",
+          "refId": "A"
+        }
+      ],
+      "title": "gRPC server error ratio",
+      "description": "Share of calls failed by the server (Unknown|Internal|Unavailable|DeadlineExceeded|DataLoss). The GRPCServerErrors alert fires above 5%.",
+      "transparent": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 29
+      },
+      "repeatDirection": "h",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "transparent"
+              },
+              {
+                "value": 0.05,
+                "color": "red"
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "thresholdsStyle": {
+              "mode": "line+area"
+            },
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, job, grpc_method) (rate(grpc_server_handling_seconds_bucket{grpc_service!=\"grpc.health.v1.Health\"}[5m])))",
+          "legendFormat": "{{job}} serves {{grpc_method}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, job, grpc_method) (rate(grpc_client_handling_seconds_bucket[5m])))",
+          "legendFormat": "{{job}} calls {{grpc_method}}",
+          "refId": "B"
+        }
+      ],
+      "title": "gRPC latency p95: server and client",
+      "description": "The client side includes the network, retries, and waiting for a connection.",
+      "transparent": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 29
+      },
+      "repeatDirection": "h",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "transparent"
+              },
+              {
+                "value": 1,
+                "color": "red"
+              }
+            ]
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "thresholdsStyle": {
+              "mode": "line+area"
+            },
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (job, grpc_method, grpc_code) (rate(grpc_client_handled_total[1m]))",
+          "legendFormat": "{{job}} → {{grpc_method}} {{grpc_code}}",
+          "refId": "A"
+        }
+      ],
+      "title": "gRPC calls by caller",
+      "description": "Unavailable without a server-side error: the service could not be reached (the gateway answers 502).",
+      "transparent": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 37
+      },
+      "repeatDirection": "h",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (result) (rate(customer_lookups_total[5m]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Customer profile lookups",
+      "description": "fresh: local copy; refreshed: from Keycloak; stale: Keycloak failed, an old copy was served; failed: no copy to fall back to.",
+      "transparent": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "repeatDirection": "h",
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "table",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "round(sum by (job, grpc_method, grpc_code) (increase(grpc_server_handled_total{grpc_service!=\"grpc.health.v1.Health\"}[$__range]))) \u003e 0",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "__auto",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "gRPC calls by method (selected range)",
+      "description": "How many calls each server handled in the selected time range: single calls are easier to see here than on the rate graphs.",
+      "transparent": false,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 45
+      },
+      "repeatDirection": "h",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            }
+          }
+        }
+      ],
+      "options": {
+        "frameIndex": 0,
+        "showHeader": true,
+        "showTypeIcons": false,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ],
+        "footer": {
+          "show": false,
+          "reducer": null,
+          "countRows": false
+        },
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "align": "auto",
+            "inspect": false
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "collapsed": false,
+      "title": "Gateway, cache, circuit breakers",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
       },
       "id": 0,
       "panels": []
@@ -549,7 +957,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 29
+        "y": 54
       },
       "repeatDirection": "h",
       "options": {
@@ -606,7 +1014,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 29
+        "y": 54
       },
       "repeatDirection": "h",
       "options": {
@@ -662,7 +1070,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 29
+        "y": 54
       },
       "repeatDirection": "h",
       "options": {
@@ -722,7 +1130,7 @@
         "h": 4,
         "w": 24,
         "x": 0,
-        "y": 37
+        "y": 62
       },
       "repeatDirection": "h",
       "options": {

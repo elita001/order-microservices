@@ -161,13 +161,17 @@ func (s *Store) handleRepeat(w http.ResponseWriter, r *http.Request, next http.H
 }
 
 // save stores a completed response or, for 5xx, releases the key so the client can retry.
+// A request the client abandoned has no response to store (the order may or may not have
+// been created), so its key is released too: the retry reaches the order service, which
+// deduplicates it by the key in the database.
 // It must finish even if the client has disconnected, otherwise the key stays locked.
 func (s *Store) save(ctx context.Context, redisKey, fingerprint string, rec *recorder) {
+	abandoned := ctx.Err() != nil
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.timeout)
 	defer cancel()
 	log := logger.FromContext(ctx)
 
-	if rec.status >= http.StatusInternalServerError {
+	if rec.status >= http.StatusInternalServerError || abandoned {
 		if err := s.rdb.Del(ctx, redisKey).Err(); err != nil && !errors.Is(err, breaker.ErrOpen) {
 			log.Warn("release idempotency key", "error", err) // the lock expires after LockTTL
 		}

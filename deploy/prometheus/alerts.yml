@@ -7,7 +7,7 @@ groups:
   - name: orderflow-availability
     rules:
       - alert: ServiceDown
-        expr: up{job=~"gateway|order|payment|delivery|notification"} == 0
+        expr: up{job=~"gateway|order|customer|payment|delivery|notification"} == 0
         for: 1m
         labels:
           severity: critical
@@ -27,6 +27,22 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $labels.job }}: {{ $value | humanizePercentage }} of requests fail with 5xx"
+
+      # The internal gRPC APIs (order, customer); HighErrorRate covers the gateway's REST API.
+      # Only codes that mean the server failed count: INVALID_ARGUMENT, NOT_FOUND, and the like
+      # are answers to bad calls.
+      - alert: GRPCServerErrors
+        expr: |
+          (
+            sum by (job, grpc_service) (rate(grpc_server_handled_total{grpc_code=~"Unknown|Internal|Unavailable|DeadlineExceeded|DataLoss"}[5m]))
+              / sum by (job, grpc_service) (rate(grpc_server_handled_total[5m])) > 0.05
+          )
+          and sum by (job, grpc_service) (increase(grpc_server_handled_total[5m])) >= 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.job }}: {{ $value | humanizePercentage }} of {{ $labels.grpc_service }} calls fail"
 
       # p95 of a handful of requests is just the slowest one.
       - alert: SlowRequests

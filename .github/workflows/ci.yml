@@ -47,6 +47,41 @@ jobs:
       - name: Integration tests (PostgreSQL, RabbitMQ)
         run: go test -tags integration -race -count=1 ./...
 
+  # Protobuf contracts of the gRPC APIs: lint, formatting, generated code up to date, and,
+  # on pull requests, no changes that break existing clients (compared with the base branch).
+  proto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # buf breaking reads the base branch from the git history
+      - uses: bufbuild/buf-action@v1
+        with:
+          version: 1.59.0 # keep in sync with BUF_VERSION in the Makefile
+          setup_only: true
+      - name: Lint
+        run: buf lint
+      - name: Formatting
+        run: buf format -d --exit-code
+      - name: Check that the generated code is up to date
+        run: |
+          buf generate
+          if [ -n "$(git status --porcelain -- gen)" ]; then
+            git status --short -- gen
+            echo "::error::Generated code is out of date: run 'make proto' and commit gen/."
+            exit 1
+          fi
+      - name: Breaking changes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e "$BASE_SHA:proto" 2>/dev/null; then
+            buf breaking --against ".git#ref=$BASE_SHA"
+          else
+            echo "The base branch has no proto/ yet: nothing to compare with."
+          fi
+
   # Dashboards are code: the committed JSON must be exactly what cmd/dashboards generates.
   dashboards:
     runs-on: ubuntu-latest
@@ -84,12 +119,12 @@ jobs:
           grafana/alloy:v1.10.2 fmt /etc/alloy/config.alloy
 
   build:
-    needs: [lint, test]
+    needs: [lint, test, proto]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        service: [gateway, order, payment, delivery, notification]
+        service: [gateway, order, customer, payment, delivery, notification]
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

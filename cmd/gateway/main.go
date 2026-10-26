@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,12 +13,14 @@ import (
 	"github.com/caarlos0/env/v11"
 	"golang.org/x/sync/errgroup"
 
+	customerv1 "github.com/elita001/order-microservices/gen/go/orderflow/customer/v1"
+	orderv1 "github.com/elita001/order-microservices/gen/go/orderflow/order/v1"
 	"github.com/elita001/order-microservices/internal/gateway"
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
-	"github.com/elita001/order-microservices/internal/gateway/proxy"
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
 	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/errtrack"
+	"github.com/elita001/order-microservices/pkg/grpcx"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/logger"
 	"github.com/elita001/order-microservices/pkg/metrics"
@@ -37,16 +38,17 @@ type config struct {
 	Telemetry telemetry.Config // OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_TRACES_SAMPLER_RATIO
 	ErrTrack  errtrack.Config  // SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_RELEASE
 
-	OrderServiceURL string `env:"ORDER_SERVICE_URL,required"`
+	// The services' gRPC APIs. A call without an answer within TIMEOUT gets 504.
+	OrderGRPC    grpcx.ClientConfig `envPrefix:"ORDER_GRPC_"`
+	CustomerGRPC grpcx.ClientConfig `envPrefix:"CUSTOMER_GRPC_"`
 
-	// Per client IP, requests per second and burst size.
+	// Per user, requests per second and burst size.
 	ReadRateLimit  int `env:"RATE_LIMIT_READ_RPS" envDefault:"50"`
 	ReadRateBurst  int `env:"RATE_LIMIT_READ_BURST" envDefault:"100"`
 	WriteRateLimit int `env:"RATE_LIMIT_WRITE_RPS" envDefault:"5"`
 	WriteRateBurst int `env:"RATE_LIMIT_WRITE_BURST" envDefault:"10"`
 
 	Redis       redisclient.Config `envPrefix:"REDIS_"`
-	Upstream    proxy.Config       `envPrefix:"UPSTREAM_"`
 	Idempotency idempotency.Config `envPrefix:"IDEMPOTENCY_"`
 	Auth        auth.Config        `envPrefix:"OIDC_"`
 }
@@ -63,10 +65,6 @@ func run() error {
 	cfg, err := env.ParseAs[config]()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
-	}
-	orderURL, err := url.Parse(cfg.OrderServiceURL)
-	if err != nil {
-		return fmt.Errorf("parse ORDER_SERVICE_URL: %w", err)
 	}
 
 	log := logger.New(cfg.LogLevel).With("service", "gateway")
@@ -104,14 +102,36 @@ func run() error {
 		log.Warn("redis is unavailable, rate limiting and fast idempotency are disabled until it recovers", "error", err)
 	}
 
+	// The gateway calls the services on the user's behalf: the user's token goes along,
+	// and each service authorizes the user itself. Only reads are retried automatically:
+	// a repeated CreateOrder is safe only with an idempotency key, which the client controls.
+	orderConn, err := grpcx.NewClient(cfg.OrderGRPC, grpcx.ClientOptions{
+		Service:      orderv1.OrderService_ServiceDesc.ServiceName,
+		RetryMethods: []string{"GetOrder", "ListOrders"},
+		Credentials:  grpcx.ForwardToken(),
+	})
+	if err != nil {
+		return err
+	}
+	defer orderConn.Close()
+	customerConn, err := grpcx.NewClient(cfg.CustomerGRPC, grpcx.ClientOptions{
+		Service:      customerv1.CustomerService_ServiceDesc.ServiceName,
+		RetryMethods: []string{"GetCustomer"},
+		Credentials:  grpcx.ForwardToken(),
+	})
+	if err != nil {
+		return err
+	}
+	defer customerConn.Close()
+
 	router := gateway.NewRouter(gateway.Config{
-		OrderServiceURL: orderURL,
-		Upstream:        cfg.Upstream,
-		ReadLimit:       ratelimit.Policy{Name: "read", Rate: cfg.ReadRateLimit, Burst: cfg.ReadRateBurst},
-		WriteLimit:      ratelimit.Policy{Name: "write", Rate: cfg.WriteRateLimit, Burst: cfg.WriteRateBurst},
-		Idempotency:     cfg.Idempotency,
-		RedisTimeout:    cfg.Redis.OperationTimeout,
-		Verifier:        auth.NewVerifier(ctx, cfg.Auth),
+		Orders:       orderv1.NewOrderServiceClient(orderConn),
+		Customers:    customerv1.NewCustomerServiceClient(customerConn),
+		ReadLimit:    ratelimit.Policy{Name: "read", Rate: cfg.ReadRateLimit, Burst: cfg.ReadRateBurst},
+		WriteLimit:   ratelimit.Policy{Name: "write", Rate: cfg.WriteRateLimit, Burst: cfg.WriteRateBurst},
+		Idempotency:  cfg.Idempotency,
+		RedisTimeout: cfg.Redis.OperationTimeout,
+		Verifier:     auth.NewVerifier(ctx, cfg.Auth),
 	}, rdb, log)
 
 	srv := &http.Server{
@@ -119,8 +139,8 @@ func run() error {
 		Handler:           telemetry.PublicHTTPHandler(router), // the public entry point
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		// Longer than the upstream timeout, so the gateway can still send its 504.
-		WriteTimeout: cfg.Upstream.Timeout + 5*time.Second,
+		// Longer than the service call timeouts, so the gateway can still send its 504.
+		WriteTimeout: max(cfg.OrderGRPC.Timeout, cfg.CustomerGRPC.Timeout) + 5*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 	metricsSrv := &http.Server{

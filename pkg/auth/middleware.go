@@ -4,9 +4,6 @@ import (
 	"errors"
 	"net/http"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
 )
@@ -18,26 +15,21 @@ func Middleware(v *Verifier, onFailure func(reason string)) func(http.Handler) h
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw, err := BearerToken(r)
 			if err == nil {
-				var p Principal
-				if p, err = v.Verify(r.Context(), raw); err == nil {
-					// The user ID is pseudonymous (a UUID), fine for logs and traces.
-					trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("enduser.id", p.UserID.String()))
-					ctx := WithPrincipal(r.Context(), p)
-					// Records logged with ctx (the use cases) and with the request logger
-					// (the adapters) both get the user.
-					ctx = logger.WithAttrs(ctx, "user_id", p.UserID.String())
-					ctx = logger.WithContext(ctx, logger.FromContext(ctx).With("user_id", p.UserID.String()))
+				ctx := r.Context()
+				if ctx, err = v.Authenticate(ctx, raw); err == nil {
 					next.ServeHTTP(w, r.WithContext(ctx))
 					return
 				}
 			}
-
-			reason := "invalid_token"
-			if errors.Is(err, ErrMissingToken) {
-				reason = "missing_token"
-			}
+			reason := FailureReason(err)
 			if onFailure != nil {
 				onFailure(reason)
+			}
+			if errors.Is(err, ErrKeysUnavailable) {
+				logger.FromContext(r.Context()).Error("cannot verify tokens: signing keys are unavailable", "error", err)
+				w.Header().Set("Retry-After", "5")
+				httpx.WriteError(w, http.StatusServiceUnavailable, "service_unavailable", "authentication is temporarily unavailable, retry later")
+				return
 			}
 			logger.FromContext(r.Context()).Info("request rejected: unauthenticated", "reason", reason, "error", err)
 			// RFC 6750: tell the client how to authenticate, without details of what was wrong.

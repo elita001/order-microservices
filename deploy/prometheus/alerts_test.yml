@@ -39,6 +39,35 @@ tests:
             exp_annotations:
               summary: "order: 10% of requests fail with 5xx"
 
+  # ---------- GRPCServerErrors ----------
+  - name: rejected gRPC calls are not server errors
+    interval: 1m
+    input_series:
+      # Every second call is NOT_FOUND: the server answered correctly.
+      - series: 'grpc_server_handled_total{job="order", grpc_service="orderflow.order.v1.OrderService", grpc_code="OK"}'
+        values: '0+50x20'
+      - series: 'grpc_server_handled_total{job="order", grpc_service="orderflow.order.v1.OrderService", grpc_code="NotFound"}'
+        values: '0+50x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GRPCServerErrors
+        exp_alerts: []
+
+  - name: failing gRPC calls at real traffic alert
+    interval: 1m
+    input_series:
+      - series: 'grpc_server_handled_total{job="customer", grpc_service="orderflow.customer.v1.CustomerService", grpc_code="OK"}'
+        values: '0+80x20'
+      - series: 'grpc_server_handled_total{job="customer", grpc_service="orderflow.customer.v1.CustomerService", grpc_code="Unavailable"}'
+        values: '0+20x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: GRPCServerErrors
+        exp_alerts:
+          - exp_labels: {severity: warning, job: customer, grpc_service: orderflow.customer.v1.CustomerService}
+            exp_annotations:
+              summary: "customer: 20% of orderflow.customer.v1.CustomerService calls fail"
+
   # ---------- SlowRequests ----------
   - name: a few slow requests do not alert
     interval: 1m

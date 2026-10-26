@@ -7,8 +7,18 @@
   "registrationAllowed": false,
   "roles": {
     "realm": [
-      { "name": "customer", "description": "Places orders and sees only their own orders" },
-      { "name": "support", "description": "Sees the orders of every customer" }
+      {
+        "name": "customer",
+        "description": "Places orders and sees only their own orders"
+      },
+      {
+        "name": "support",
+        "description": "Sees the orders of every customer"
+      },
+      {
+        "name": "customer-reader",
+        "description": "Service accounts that read customer profiles (e.g., the notification service)"
+      }
     ]
   },
   "clients": [
@@ -20,9 +30,15 @@
       "publicClient": true,
       "directAccessGrantsEnabled": true,
       "standardFlowEnabled": true,
-      "redirectUris": ["http://localhost:*"],
-      "webOrigins": ["+"],
-      "attributes": { "pkce.code.challenge.method": "S256" },
+      "redirectUris": [
+        "http://localhost:*"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
       "protocolMappers": [
         {
           "name": "orderflow-api audience",
@@ -36,6 +52,43 @@
           }
         }
       ]
+    },
+    {
+      "clientId": "notification-service",
+      "name": "Notification service",
+      "description": "Service account (client credentials grant): reads customer profiles from the customer service to email customers.",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${NOTIFICATION_CLIENT_SECRET}",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocolMappers": [
+        {
+          "name": "orderflow-api audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "orderflow-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "customer-service",
+      "name": "Customer service",
+      "description": "Service account (client credentials grant): reads users from the Keycloak Admin API (view-users only).",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${CUSTOMER_CLIENT_SECRET}",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false
     }
   ],
   "users": [
@@ -47,8 +100,16 @@
       "firstName": "Alice",
       "lastName": "Customer",
       "enabled": true,
-      "credentials": [{ "type": "password", "value": "alice", "temporary": false }],
-      "realmRoles": ["customer"]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "customer"
+      ]
     },
     {
       "id": "b0b00000-0000-4000-8000-000000000002",
@@ -58,8 +119,16 @@
       "firstName": "Bob",
       "lastName": "Customer",
       "enabled": true,
-      "credentials": [{ "type": "password", "value": "bob", "temporary": false }],
-      "realmRoles": ["customer"]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "bob",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "customer"
+      ]
     },
     {
       "id": "5a990000-0000-4000-8000-000000000003",
@@ -69,8 +138,34 @@
       "firstName": "Sam",
       "lastName": "Support",
       "enabled": true,
-      "credentials": [{ "type": "password", "value": "support", "temporary": false }],
-      "realmRoles": ["support"]
+      "credentials": [
+        {
+          "type": "password",
+          "value": "support",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "support"
+      ]
+    },
+    {
+      "username": "service-account-notification-service",
+      "enabled": true,
+      "serviceAccountClientId": "notification-service",
+      "realmRoles": [
+        "customer-reader"
+      ]
+    },
+    {
+      "username": "service-account-customer-service",
+      "enabled": true,
+      "serviceAccountClientId": "customer-service",
+      "clientRoles": {
+        "realm-management": [
+          "view-users"
+        ]
+      }
     }
   ]
 }

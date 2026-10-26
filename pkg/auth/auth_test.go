@@ -43,6 +43,36 @@ func TestVerifier(t *testing.T) {
 	}
 }
 
+// Keycloak is down and the keys are not cached: the token cannot be checked, which is
+// not the client's fault (503, not 401).
+func TestVerifier_KeysUnavailable(t *testing.T) {
+	idp := authtest.NewIDP(t)
+	cfg := idp.Config
+	cfg.JWKSURL = "http://127.0.0.1:1/certs" // nothing listens on port 1
+	verifier := auth.NewVerifier(context.Background(), cfg)
+
+	_, err := verifier.Verify(context.Background(), idp.Customer(t, uuid.New()))
+	if !errors.Is(err, auth.ErrKeysUnavailable) || errors.Is(err, auth.ErrInvalidToken) {
+		t.Fatalf("got %v, want ErrKeysUnavailable", err)
+	}
+	// A token that is invalid by itself stays invalid, whatever the keys.
+	if _, err := verifier.Verify(context.Background(), "garbage"); !errors.Is(err, auth.ErrInvalidToken) {
+		t.Errorf("garbage: got %v, want ErrInvalidToken", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+idp.Customer(t, uuid.New()))
+	var reasons []string
+	auth.Middleware(verifier, func(reason string) { reasons = append(reasons, reason) })(http.NotFoundHandler()).ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Errorf("middleware: %d, want 503 with Retry-After", rec.Code)
+	}
+	if len(reasons) != 1 || reasons[0] != "keys_unavailable" {
+		t.Errorf("failure reasons = %v", reasons)
+	}
+}
+
 func TestMiddleware(t *testing.T) {
 	idp := authtest.NewIDP(t)
 	verifier := auth.NewVerifier(context.Background(), idp.Config)

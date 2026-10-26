@@ -67,7 +67,10 @@ func write(path string, builder *dashboard.DashboardBuilder) error {
 
 // ---------- shared settings ----------
 
-const services5 = "gateway|order|payment|delivery|notification"
+const services6 = "gateway|order|customer|payment|delivery|notification"
+
+// gRPC codes that mean the server failed (the same as in the GRPCServerErrors alert).
+const grpcServerErrors = "Unknown|Internal|Unavailable|DeadlineExceeded|DataLoss"
 
 var (
 	promDS = common.DataSourceRef{Type: cog.ToPtr("prometheus"), Uid: cog.ToPtr("prometheus")}
@@ -194,6 +197,17 @@ func barsPanel(title, expr, legend string) *bargauge.PanelBuilder {
 		ReduceOptions(reduceLast())
 }
 
+// countsTable shows the counts over the selected time range, one row per label set,
+// largest first.
+func countsTable(title, expr string) *table.PanelBuilder {
+	return table.NewPanelBuilder().
+		Title(title).Datasource(promDS).Span(24).Height(8).Unit("short").
+		WithTarget(promQuery(expr, "").Instant().Format(prometheus.PromQueryFormatTable)).
+		WithTransformation(dashboard.DataTransformerConfig{Id: "organize", Options: map[string]any{"excludeByName": map[string]bool{"Time": true}}}).
+		ShowHeader(true).
+		SortBy([]cog.Builder[common.TableSortByFieldState]{common.NewTableSortByFieldStateBuilder().DisplayName("Value").Desc(true)})
+}
+
 func links() []cog.Builder[dashboard.DashboardLink] {
 	var list []cog.Builder[dashboard.DashboardLink]
 	for _, l := range [][2]string{{"Business", "orderflow-business"}, {"Services", "orderflow-services"},
@@ -257,7 +271,7 @@ func services() *dashboard.DashboardBuilder {
 
 	return newDashboard("orderflow-services", "OrderFlow - Services",
 		"RED metrics of every service, the gateway, the cache, and circuit breakers.").
-		WithPanel(withState(statPanel("Service health", `up{job=~"`+services5+`"}`, "{{job}}", "short", 24, 3),
+		WithPanel(withState(statPanel("Service health", `up{job=~"`+services6+`"}`, "{{job}}", "short", 24, 3),
 			step{bad, nil}, step{good, from(1)}).
 			Mappings(valueMap(map[string][2]string{"0": {"DOWN", bad}, "1": {"UP", good}}))).
 		WithRow(dashboard.NewRowBuilder("RED: rate, errors, duration")).
@@ -274,13 +288,29 @@ func services() *dashboard.DashboardBuilder {
 		WithPanel(timeseriesPanel("Gateway responses by status", "reqps", 12,
 			series{`sum by (status) (rate(http_requests_total{job="gateway"}[1m]))`, "{{status}}"}).
 			Description("429: rate limited, 502/504: upstream unavailable or too slow, 503: database down.")).
-		WithPanel(table.NewPanelBuilder().
-			Title("Requests by route (selected range)").Datasource(promDS).Span(24).Height(8).Unit("short").
-			WithTarget(promQuery(`round(sum by (job, method, route, status) (increase(http_requests_total{job=~"`+services5+`"}[$__range]))) > 0`, "").
-				Instant().Format(prometheus.PromQueryFormatTable)).
-			WithTransformation(dashboard.DataTransformerConfig{Id: "organize", Options: map[string]any{"excludeByName": map[string]bool{"Time": true}}}).
-			ShowHeader(true).
-			SortBy([]cog.Builder[common.TableSortByFieldState]{common.NewTableSortByFieldStateBuilder().DisplayName("Value").Desc(true)})).
+		WithPanel(countsTable("Requests by route (selected range)",
+			`round(sum by (job, method, route, status) (increase(http_requests_total{job=~"`+services6+`"}[$__range]))) > 0`)).
+		WithRow(dashboard.NewRowBuilder("gRPC: order and customer services")).
+		WithPanel(timeseriesPanel("gRPC calls by method and code", "reqps", 8,
+			series{`sum by (grpc_method, grpc_code) (rate(grpc_server_handled_total{grpc_service!="grpc.health.v1.Health"}[1m]))`, "{{grpc_method}} {{grpc_code}}"}).
+			Description("Calls the servers handled. NotFound, InvalidArgument, PermissionDenied are answers to bad calls, not failures.")).
+		WithPanel(withLimit(timeseriesPanel("gRPC server error ratio", "percentunit", 8, series{
+			`(sum by (job) (rate(grpc_server_handled_total{grpc_code=~"` + grpcServerErrors + `"}[5m])) or sum by (job) (rate(grpc_server_handled_total[5m])) * 0)` +
+				` / sum by (job) (rate(grpc_server_handled_total[5m]))`, "{{job}}",
+		}), 0.05).Description("Share of calls failed by the server (" + grpcServerErrors + "). The GRPCServerErrors alert fires above 5%.")).
+		WithPanel(withLimit(timeseriesPanel("gRPC latency p95: server and client", "s", 8,
+			series{`histogram_quantile(0.95, sum by (le, job, grpc_method) (rate(grpc_server_handling_seconds_bucket{grpc_service!="grpc.health.v1.Health"}[5m])))`, "{{job}} serves {{grpc_method}}"},
+			series{`histogram_quantile(0.95, sum by (le, job, grpc_method) (rate(grpc_client_handling_seconds_bucket[5m])))`, "{{job}} calls {{grpc_method}}"}), 1).
+			Description("The client side includes the network, retries, and waiting for a connection.")).
+		WithPanel(timeseriesPanel("gRPC calls by caller", "reqps", 12,
+			series{`sum by (job, grpc_method, grpc_code) (rate(grpc_client_handled_total[1m]))`, "{{job}} → {{grpc_method}} {{grpc_code}}"}).
+			Description("Unavailable without a server-side error: the service could not be reached (the gateway answers 502).")).
+		WithPanel(timeseriesPanel("Customer profile lookups", "ops", 12,
+			series{`sum by (result) (rate(customer_lookups_total[5m]))`, "{{result}}"}).
+			Description("fresh: local copy; refreshed: from Keycloak; stale: Keycloak failed, an old copy was served; failed: no copy to fall back to.")).
+		WithPanel(countsTable("gRPC calls by method (selected range)",
+			`round(sum by (job, grpc_method, grpc_code) (increase(grpc_server_handled_total{grpc_service!="grpc.health.v1.Health"}[$__range]))) > 0`).
+			Description("How many calls each server handled in the selected time range: single calls are easier to see here than on the rate graphs.")).
 		WithRow(dashboard.NewRowBuilder("Gateway, cache, circuit breakers")).
 		WithPanel(timeseriesPanel("Rate limiter decisions", "reqps", 8,
 			series{`sum by (policy, decision) (rate(gateway_rate_limit_decisions_total[1m]))`, "{{policy}} {{decision}}"}).
@@ -344,8 +374,8 @@ func logsDashboard() *dashboard.DashboardBuilder {
 	return newDashboard("orderflow-logs", "OrderFlow - Logs",
 		"Logs of all services in Loki, filterable by request ID, with links to traces in Tempo.").
 		WithVariable(dashboard.NewCustomVariableBuilder("service").Label("Service").
-			Values(dashboard.StringOrMap{String: cog.ToPtr("gateway,order,payment,delivery,notification")}).
-			Multi(true).IncludeAll(true).AllValue(services5).
+			Values(dashboard.StringOrMap{String: cog.ToPtr("gateway,order,customer,payment,delivery,notification")}).
+			Multi(true).IncludeAll(true).AllValue(services6).
 			Current(dashboard.VariableOption{
 				Selected: cog.ToPtr(true),
 				Text:     dashboard.StringOrArrayOfString{ArrayOfString: []string{"All"}},

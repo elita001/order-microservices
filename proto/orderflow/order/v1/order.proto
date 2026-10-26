@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package orderflow.order.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// OrderService places orders and reads them. It is internal: external clients use the
+// REST API of the gateway, which calls this service.
+//
+// Every call must carry the caller's access token in the "authorization" metadata
+// ("Bearer <JWT>"): the service verifies it itself and takes the customer from it.
+// Errors carry a google.rpc.ErrorInfo detail with a stable reason (domain "order.orderflow"),
+// so callers never parse messages:
+//   INVALID_ARGUMENT   reason VALIDATION_FAILED (plus google.rpc.BadRequest with the field)
+//                      or IDEMPOTENCY_KEY_REUSED
+//   NOT_FOUND          the order does not exist or belongs to another customer
+//   PERMISSION_DENIED  listing another customer's orders without the support role
+//   UNAVAILABLE        reason DATABASE_UNAVAILABLE: retry later
+service OrderService {
+  // CreateOrder places an order for the authenticated customer. With an idempotency key,
+  // a repeated call returns the order created by the first one (replayed = true).
+  rpc CreateOrder(CreateOrderRequest) returns (CreateOrderResponse);
+  // GetOrder returns an order with its items.
+  rpc GetOrder(GetOrderRequest) returns (GetOrderResponse);
+  // ListOrders returns a customer's orders, newest first, without items.
+  rpc ListOrders(ListOrdersRequest) returns (ListOrdersResponse);
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  ORDER_STATUS_PENDING = 1;
+  ORDER_STATUS_PAID = 2;
+  ORDER_STATUS_PAYMENT_FAILED = 3;
+  ORDER_STATUS_SHIPPED = 4;
+}
+
+message OrderItem {
+  string product_id = 1;
+  int32 quantity = 2;
+  // Per-unit price in minor currency units (kopecks, cents).
+  int64 price = 3;
+}
+
+message Order {
+  string id = 1;
+  string customer_id = 2;
+  OrderStatus status = 3;
+  repeated OrderItem items = 4;
+  // In minor currency units.
+  int64 total_amount = 5;
+  // ISO 4217 code: RUB, USD, EUR.
+  string currency = 6;
+  google.protobuf.Timestamp create_time = 7;
+  google.protobuf.Timestamp update_time = 8;
+}
+
+message OrderSummary {
+  string id = 1;
+  OrderStatus status = 2;
+  int64 total_amount = 3;
+  string currency = 4;
+  google.protobuf.Timestamp create_time = 5;
+}
+
+message CreateOrderRequest {
+  // There is no customer_id: the customer is the authenticated caller.
+  string currency = 1;
+  repeated OrderItem items = 2;
+  // Optional. The same key with a different request is rejected (IDEMPOTENCY_KEY_REUSED).
+  // Keys are scoped by customer.
+  string idempotency_key = 3;
+}
+
+message CreateOrderResponse {
+  Order order = 1;
+  // True if the order was created earlier by a call with the same idempotency key.
+  bool replayed = 2;
+}
+
+message GetOrderRequest {
+  string order_id = 1;
+}
+
+message GetOrderResponse {
+  Order order = 1;
+}
+
+message ListOrdersRequest {
+  // Optional: the caller's own orders by default. Only support may list other customers.
+  string customer_id = 1;
+  // 1..100, 20 by default.
+  int32 limit = 2;
+  int32 offset = 3;
+}
+
+message ListOrdersResponse {
+  repeated OrderSummary orders = 1;
+  int32 limit = 2;
+  int32 offset = 3;
+}

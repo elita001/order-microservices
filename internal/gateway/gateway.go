@@ -1,12 +1,12 @@
-// Package gateway is the entry point for external clients: it routes requests to the
-// services and applies the edge concerns: request IDs, rate limits, idempotency, timeouts.
+// Package gateway is the entry point for external clients: it serves the public REST API,
+// calls the services over gRPC, and applies the edge concerns: authentication, request IDs,
+// rate limits, idempotency, and deadlines.
 package gateway
 
 import (
 	"context"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -14,8 +14,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
 
+	customerv1 "github.com/elita001/order-microservices/gen/go/orderflow/customer/v1"
+	orderv1 "github.com/elita001/order-microservices/gen/go/orderflow/order/v1"
 	"github.com/elita001/order-microservices/internal/gateway/idempotency"
-	"github.com/elita001/order-microservices/internal/gateway/proxy"
 	"github.com/elita001/order-microservices/internal/gateway/ratelimit"
 	"github.com/elita001/order-microservices/pkg/auth"
 	"github.com/elita001/order-microservices/pkg/httpx"
@@ -24,12 +25,15 @@ import (
 )
 
 type Config struct {
-	OrderServiceURL *url.URL
-	Upstream        proxy.Config
-	ReadLimit       ratelimit.Policy // GET requests
-	WriteLimit      ratelimit.Policy // POST requests
-	Idempotency     idempotency.Config
-	RedisTimeout    time.Duration // per Redis call; Redis failures are tolerated (fail-open)
+	// Clients of the services. Each call carries the user's access token, the request ID,
+	// and the trace context, and has a deadline.
+	Orders    orderv1.OrderServiceClient
+	Customers customerv1.CustomerServiceClient
+
+	ReadLimit    ratelimit.Policy // GET requests
+	WriteLimit   ratelimit.Policy // POST requests
+	Idempotency  idempotency.Config
+	RedisTimeout time.Duration // per Redis call; Redis failures are tolerated (fail-open)
 	// Verifier checks access tokens. The gateway rejects unauthenticated requests early;
 	// the services verify the token again and never trust identity from headers.
 	Verifier *auth.Verifier
@@ -43,22 +47,30 @@ var authFailures = promauto.NewCounterVec(prometheus.CounterOpts{
 func NewRouter(cfg Config, rdb *redis.Client, log *slog.Logger) http.Handler {
 	limiter := ratelimit.New(rdb, cfg.RedisTimeout)
 	idempotent := idempotency.New(rdb, cfg.Idempotency, cfg.RedisTimeout)
-	orders := proxy.New(cfg.OrderServiceURL, cfg.Upstream)
+	orders := orders{client: cfg.Orders}
+	customers := customers{client: cfg.Customers}
+	// Authentication comes first: rate limits and idempotency keys are per user.
+	authenticate := auth.Middleware(cfg.Verifier, func(reason string) { authFailures.WithLabelValues(reason).Inc() })
+	read := limiter.Middleware(cfg.ReadLimit)
 
 	r := chi.NewRouter()
 	// metrics.HTTP sits outside Recoverer, so a recovered panic is counted as a 500.
 	r.Use(httpx.RequestID, httpx.Logger(log), metrics.HTTP, telemetry.RouteName, httpx.Recoverer)
 
 	// The gateway is ready while it runs: Redis is optional (fail-open), and an unavailable
-	// upstream must not take the whole entry point out of the load balancer.
+	// service must not take the whole entry point out of the load balancer.
 	httpx.RegisterHealth(r, func(context.Context) error { return nil })
 
 	r.Route("/api/v1/orders", func(r chi.Router) {
-		// Authentication comes first: rate limits and idempotency keys are per user.
-		r.Use(auth.Middleware(cfg.Verifier, func(reason string) { authFailures.WithLabelValues(reason).Inc() }))
-		r.With(limiter.Middleware(cfg.WriteLimit), idempotent.Middleware).Post("/", orders.ServeHTTP)
-		r.With(limiter.Middleware(cfg.ReadLimit)).Get("/", orders.ServeHTTP)
-		r.With(limiter.Middleware(cfg.ReadLimit)).Get("/{id}", orders.ServeHTTP)
+		r.Use(authenticate)
+		r.With(limiter.Middleware(cfg.WriteLimit), idempotent.Middleware).Post("/", orders.create)
+		r.With(read).Get("/", orders.list)
+		r.With(read).Get("/{id}", orders.get)
+	})
+	r.Route("/api/v1/customers", func(r chi.Router) {
+		r.Use(authenticate, read)
+		r.Get("/me", customers.me)
+		r.Get("/{id}", customers.get)
 	})
 
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {

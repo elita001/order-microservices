@@ -42,6 +42,10 @@ type Email struct {
 // ErrInvalidRecipient means the email address is rejected; retrying cannot help.
 var ErrInvalidRecipient = errors.New("invalid recipient")
 
+// ErrUnknownCustomer means the customer does not exist (e.g., the user was deleted in the
+// identity provider); retrying cannot help.
+var ErrUnknownCustomer = errors.New("unknown customer")
+
 // ErrOutOfOrder means an event arrived before the one it follows; it is retried later.
 var ErrOutOfOrder = errors.New("event arrived before the event it follows")
 
@@ -202,5 +206,5 @@ func (s *Service) notify(ctx context.Context, kind domain.Kind, orderID, custome
 // IsPermanentError reports whether err is caused by input that retrying cannot fix.
 func IsPermanentError(err error) bool {
 	var validationErr *domain.ValidationError
-	return errors.As(err, &validationErr) || errors.Is(err, ErrInvalidRecipient)
+	return errors.As(err, &validationErr) || errors.Is(err, ErrInvalidRecipient) || errors.Is(err, ErrUnknownCustomer)
 }

@@ -3,7 +3,7 @@
 RABBITMQ_URL ?= amqp://$(RABBITMQ_USER):$(RABBITMQ_PASSWORD)@localhost:$(or $(RABBITMQ_PORT),5672)/
 SERVICE_QUEUES = order-service payment-service delivery-service notification-service
 
-.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards lint test-integration test-alerts check token
+.PHONY: up down logs ps test tidy migrate-new outbox orders dlq-list dlq-replay rabbitmq-reset-queues dashboards lint test-integration test-alerts check token proto proto-lint proto-breaking
 
 up: .env      ## build and start everything
 	docker compose up -d --build --remove-orphans
@@ -16,7 +16,7 @@ down:          ## stop everything (add -v to remove database data)
 	docker compose down
 
 logs:          ## follow application logs
-	docker compose logs -f gateway order payment delivery notification
+	docker compose logs -f gateway order customer payment delivery notification
 
 ps:
 	docker compose ps
@@ -53,7 +53,26 @@ test-alerts:   ## unit tests of the Prometheus alert rules (deploy/prometheus/al
 	docker run --rm --entrypoint promtool -v $(CURDIR)/deploy/prometheus:/etc/prometheus:ro -w /etc/prometheus \
 		prom/prometheus:v3.5.0 test rules alerts_test.yml
 
-check: lint test test-alerts test-integration ## everything CI checks, locally
+check: lint proto-lint test test-alerts test-integration ## everything CI checks, locally
+
+BUF_VERSION = 1.59.0
+# buf in Docker; code generation runs the protoc plugins remotely (buf.gen.yaml).
+BUF = docker run --rm -v $(CURDIR):/workspace -w /workspace --user $(shell id -u):$(shell id -g) \
+	-e BUF_CACHE_DIR=/tmp/buf bufbuild/buf:$(BUF_VERSION)
+
+proto:         ## format and lint proto/, regenerate the Go code in gen/
+	$(BUF) format -w
+	$(BUF) lint
+	$(BUF) generate
+
+proto-lint:    ## lint proto/ and check the formatting
+	$(BUF) lint
+	$(BUF) format -d --exit-code
+
+proto-breaking: ## reject changes to proto/ that break existing clients, compared with main
+	@if git cat-file -e main:proto 2>/dev/null; then $(BUF) breaking --against '.git#branch=main'; \
+	else echo "main has no proto/ yet: nothing to compare with"; fi
+
 
 tidy:
 	go mod tidy

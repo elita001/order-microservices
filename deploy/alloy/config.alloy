@@ -36,7 +36,7 @@ loki.source.docker "containers" {
 loki.process "services" {
   // Our services log JSON (log/slog). Infrastructure containers keep their raw lines.
   stage.match {
-    selector = "{service=~\"gateway|order|payment|delivery|notification\"}"
+    selector = "{service=~\"gateway|order|customer|payment|delivery|notification\"}"
 
     stage.json {
       expressions = {

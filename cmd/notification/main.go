@@ -15,13 +15,17 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/sync/errgroup"
 
+	customerv1 "github.com/elita001/order-microservices/gen/go/orderflow/customer/v1"
 	"github.com/elita001/order-microservices/internal/notification/adapter/customer"
 	notificationmessaging "github.com/elita001/order-microservices/internal/notification/adapter/messaging"
 	notificationmetrics "github.com/elita001/order-microservices/internal/notification/adapter/metrics"
 	notificationpostgres "github.com/elita001/order-microservices/internal/notification/adapter/postgres"
 	"github.com/elita001/order-microservices/internal/notification/adapter/smtp"
 	"github.com/elita001/order-microservices/internal/notification/application"
+	"github.com/elita001/order-microservices/pkg/auth"
+	"github.com/elita001/order-microservices/pkg/breaker"
 	"github.com/elita001/order-microservices/pkg/errtrack"
+	"github.com/elita001/order-microservices/pkg/grpcx"
 	"github.com/elita001/order-microservices/pkg/httpserver"
 	"github.com/elita001/order-microservices/pkg/httpx"
 	"github.com/elita001/order-microservices/pkg/logger"
@@ -48,6 +52,12 @@ type config struct {
 
 	Consumer rabbitmq.ConsumerConfig `envPrefix:"CONSUMER_"`
 	SMTP     smtp.Config             `envPrefix:"SMTP_"`
+
+	// The customer service (gRPC) provides the recipients' emails. Events are not user
+	// requests, so the service calls it with its own token (client credentials).
+	CustomerGRPC    grpcx.ClientConfig     `envPrefix:"CUSTOMER_GRPC_"`
+	CustomerBreaker breaker.Config         `envPrefix:"CUSTOMER_BREAKER_"`
+	ServiceAccount  auth.ClientCredentials `envPrefix:"OIDC_"`
 }
 
 func main() {
@@ -94,8 +104,19 @@ func run() error {
 	}
 	defer pool.Close()
 
+	customerConn, err := grpcx.NewClient(cfg.CustomerGRPC, grpcx.ClientOptions{
+		Service:      customerv1.CustomerService_ServiceDesc.ServiceName,
+		RetryMethods: []string{"GetCustomer"},
+		Credentials:  grpcx.ServiceToken(cfg.ServiceAccount.TokenSource(ctx)),
+	})
+	if err != nil {
+		return err
+	}
+	defer customerConn.Close()
+	customers := customer.NewClient(customerConn, cfg.CustomerBreaker, log)
+
 	repo := notificationpostgres.NewRepository(pool)
-	svc := application.NewService(repo, customer.Stub{}, smtp.NewMailer(cfg.SMTP), log).WithMetrics(notificationmetrics.Prometheus{})
+	svc := application.NewService(repo, customers, smtp.NewMailer(cfg.SMTP), log).WithMetrics(notificationmetrics.Prometheus{})
 	eventHandler := notificationmessaging.NewHandler(svc)
 
 	consumer := rabbitmq.NewConsumer(cfg.RabbitMQURL, serviceName, rabbitmq.Topology{

@@ -13,7 +13,10 @@ scrape_configs:
       - targets: ["gateway:9080"] # separate internal port, the main one is public
   - job_name: order
     static_configs:
-      - targets: ["order:8081"]
+      - targets: ["order:8081"] # the HTTP port: metrics and probes; the API is gRPC on 9081
+  - job_name: customer
+    static_configs:
+      - targets: ["customer:8085"]
   - job_name: payment
     static_configs:
       - targets: ["payment:8082"]

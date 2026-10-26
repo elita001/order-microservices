@@ -136,7 +136,7 @@ func migrate(ctx context.Context, dsn string) error {
 	}
 	defer pool.Close()
 
-	for _, service := range []string{"order", "payment", "delivery", "notification"} {
+	for _, service := range []string{"order", "payment", "delivery", "notification", "customer"} {
 		files, err := filepath.Glob(filepath.Join(root, "migrations", service, "*.up.sql"))
 		if err != nil {
 			return err

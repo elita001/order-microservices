@@ -3,7 +3,7 @@
 [![CI](https://github.com/elita001/order-microservices/actions/workflows/ci.yml/badge.svg)](https://github.com/elita001/order-microservices/actions/workflows/ci.yml)
 ![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white)
 
-An order processing system of five Go microservices, built as a production-style portfolio
+An order processing system of six Go microservices, built as a production-style portfolio
 project: event-driven, fault-tolerant, and observable end to end. One `make up` starts the
 whole system with its infrastructure and monitoring.
 
@@ -11,6 +11,11 @@ whole system with its infrastructure and monitoring.
 
 - **Authentication with zero trust.** OAuth 2.0 / OpenID Connect with Keycloak: the gateway
   and each service verify the access token themselves; customers see only their own orders.
+  Services calling each other on their own behalf use the client credentials grant.
+- **gRPC inside, REST outside.** The gateway serves the public REST API and calls the services
+  over gRPC: contracts in protobuf (buf lint and breaking-change checks in CI), deadlines that
+  travel with the call, retries of safe methods, standard health checks, and errors with
+  machine-readable reasons (`google.rpc.ErrorInfo`).
 - **Transactional outbox.** Business data and events are committed in one transaction; a
   relay publishes them with publisher confirms, so an event exists if and only if the change does.
 - **Idempotency everywhere.** `Idempotency-Key` in the gateway (Redis) backed by a unique key
@@ -28,7 +33,7 @@ whole system with its infrastructure and monitoring.
 - **Tested against real dependencies.** Unit tests, integration tests with testcontainers
   (PostgreSQL, RabbitMQ), golangci-lint, and GitHub Actions CI.
 
-**Stack:** Go 1.27 · PostgreSQL 16 · RabbitMQ 4 (quorum queues) · Redis 7 · Keycloak 26 · Docker Compose ·
+**Stack:** Go 1.27 · gRPC + protobuf (buf) · PostgreSQL 16 · RabbitMQ 4 (quorum queues) · Redis 7 · Keycloak 26 · Docker Compose ·
 Prometheus · Grafana · Loki · Tempo · Grafana Alloy · OpenTelemetry · GlitchTip (Sentry SDK)
 
 ## Architecture
@@ -36,12 +41,14 @@ Prometheus · Grafana · Loki · Tempo · Grafana Alloy · OpenTelemetry · Glit
 ```mermaid
 flowchart LR
     client([Client]) -->|login| keycloak[Keycloak]
-    client -->|HTTP + access token| gateway[API Gateway]
+    client -->|REST + access token| gateway[API Gateway]
     gateway -. signing keys .-> keycloak
-    order -. signing keys .-> keycloak
     gateway -->|rate limits, idempotency keys| redis[(Redis)]
-    gateway -->|HTTP| order[Order Service]
+    gateway -->|gRPC + user token| order[Order Service]
+    gateway -->|gRPC + user token| customer[Customer Service]
     order -->|order cache| redis
+    customer -->|users: Admin API| keycloak
+    notification -->|"gRPC + service token"| customer
 
     order -- order.created --> mq{{RabbitMQ}}
     mq -- order.created --> payment[Payment Service]
@@ -55,13 +62,14 @@ flowchart LR
     delivery --> carrier[/Carrier stub/]
     notification -->|SMTP| mailpit[/Mailpit/]
 
-    order & payment & delivery & notification --> pg[(PostgreSQL)]
+    order & customer & payment & delivery & notification --> pg[(PostgreSQL)]
 ```
 
 | Service              | Responsibility |
 |----------------------|----------------|
-| API Gateway          | the single entry point: request IDs, rate limiting, idempotency, timeouts |
-| Order Service        | creates, retrieves, and lists orders; tracks their status from events; caches orders in Redis |
+| API Gateway          | the single entry point: the public REST API over the services' gRPC APIs, authentication, request IDs, rate limiting, idempotency, deadlines |
+| Order Service        | creates, retrieves, and lists orders (gRPC); tracks their status from events; caches orders in Redis |
+| Customer Service     | customer profiles (gRPC): local copies of Keycloak users, refreshed from the Keycloak Admin API |
 | Payment Service      | charges orders through a payment provider stub, publishes the result |
 | Delivery Service     | hands paid orders over to a carrier stub, publishes the tracking number |
 | Notification Service | emails customers about every order step (Mailpit in development) |
@@ -74,6 +82,7 @@ sequenceDiagram
     actor C as Client
     participant G as Gateway
     participant O as Order
+    participant CU as Customer
     participant MQ as RabbitMQ
     participant P as Payment
     participant D as Delivery
@@ -81,13 +90,17 @@ sequenceDiagram
 
     C->>G: POST /api/v1/orders (Bearer token, Idempotency-Key)
     G->>G: verify the token, rate limit per user
-    G->>O: forward with the token, X-Request-Id, and traceparent
+    G->>O: gRPC CreateOrder with the user's token, x-request-id, traceparent, deadline
     O->>O: verify the token again, customer = token subject
     O->>O: save the order and order.created in one transaction
-    O-->>C: 201 Created (pending)
+    O-->>G: Order
+    G-->>C: 201 Created (pending)
     O->>MQ: the outbox relay publishes order.created
     MQ->>P: order.created
-    MQ->>N: order.created: "order received" email
+    MQ->>N: order.created
+    N->>CU: gRPC GetCustomer with its own token (client credentials)
+    CU-->>N: email (local copy, refreshed from Keycloak)
+    N->>N: "order received" email
     P->>P: charge the provider, save the payment and payment.succeeded
     P->>MQ: payment.succeeded
     MQ->>O: order becomes paid
@@ -119,8 +132,8 @@ environment variables and contain no secrets or credentials. `.env` is for local
 development only; in production, values come from the platform (Kubernetes Secrets,
 Vault, CI/CD variables).
 
-Clients use the API gateway at http://localhost:8080. The services' own ports
-(8081–8084) are published for debugging only.
+Clients use the API gateway at http://localhost:8080. The services' own ports are published
+for debugging only: gRPC APIs on 9081 (order) and 9085 (customer), metrics and probes on 8081–8085.
 
 Management UIs:
 
@@ -143,7 +156,9 @@ Useful commands:
 | `make test`     | unit tests with the race detector                    |
 | `make test-integration` | integration tests with real PostgreSQL and RabbitMQ (needs Docker) |
 | `make lint`     | golangci-lint, the same version as in CI             |
-| `make check`    | everything CI checks: lint, unit and integration tests |
+| `make check`    | everything CI checks: lint, proto lint, unit and integration tests |
+| `make proto`    | format and lint `proto/`, regenerate the Go code in `gen/` (buf in Docker) |
+| `make proto-breaking` | check `proto/` for changes that break existing clients, compared with `main` |
 | `make dashboards` | regenerate the Grafana dashboards after editing `cmd/dashboards` |
 | `make dlq-list queue=payment-service`   | show dead-lettered messages with their errors |
 | `make dlq-replay queue=payment-service` | move dead-lettered messages back for processing |
@@ -185,6 +200,24 @@ curl -s 'localhost:8080/api/v1/orders?limit=20&offset=0' -H "Authorization: Bear
 
 Amounts are stored in the currency's smallest units (kopecks): `59900` = RUB 599.00.
 
+Your profile (from Keycloak, via the customer service); `support` may read anyone's with
+`/api/v1/customers/<id>`:
+
+```bash
+curl -s 'localhost:8080/api/v1/customers/me' -H "Authorization: Bearer $TOKEN"
+```
+
+The gRPC APIs can be called directly with [grpcurl](https://github.com/fullstorydev/grpcurl)
+(reflection is enabled in development). Without a valid token they answer `Unauthenticated`:
+
+```bash
+docker run --rm --network order-microservices_default fullstorydev/grpcurl:v1.9.3 -plaintext order:9081 list
+```
+
+```bash
+docker run --rm --network order-microservices_default fullstorydev/grpcurl:v1.9.3 -plaintext -H "authorization: Bearer $TOKEN" -d '{"limit": 5}' order:9081 orderflow.order.v1.OrderService/ListOrders
+```
+
 ## Authentication and authorization
 
 Clients log in to **Keycloak** (OAuth 2.0 / OpenID Connect) and call the API with the access
@@ -194,14 +227,21 @@ from `deploy/keycloak/orderflow-realm.json` on startup.
 | User | Password | Role | May |
 |------|----------|------|-----|
 | `alice`, `bob` | same as the user name | `customer` | place orders, see and list their own orders |
-| `support` | `support` | `support` | see and list the orders of every customer |
+| `support` | `support` | `support` | see and list the orders and profiles of every customer |
 
-**Zero trust.** The gateway verifies the token and rejects bad requests early (`401`). Order
-Service verifies the same token again and takes the customer from its `sub` claim. It never
-trusts identity headers such as `X-User-Id`: its port can be reached directly (it is even
-published for debugging), and such a header could be set by anyone. A verifier checks the
+**Zero trust.** The gateway verifies the token and rejects bad requests early (`401`), then
+forwards the same token in the gRPC `authorization` metadata. Order and Customer Service verify
+it again and take the user from its `sub` claim. They never trust identity metadata such as
+`x-user-id`: their ports can be reached directly (they are even published for debugging), and
+such a value could be set by anyone. A verifier checks the
 signature (keys from Keycloak's JWKS, cached and refreshed on key rotation), the issuer, the
 audience (`orderflow-api`, so a token issued for another API is rejected), and the expiry.
+
+**Keycloak outages.** The keys are cached, so a running service keeps verifying tokens while
+Keycloak is down. A service that starts during the outage has no keys yet: it cannot tell a
+valid token from a forged one, so it answers `503` (gRPC `UNAVAILABLE`, reason
+`IDENTITY_PROVIDER_UNAVAILABLE`) — not `401`, which would send clients to log in again for
+nothing. `gateway_auth_failures_total{reason="keys_unavailable"}` counts such requests.
 
 **Authorization rules** live in the use cases, not in the HTTP layer:
 
@@ -221,7 +261,92 @@ issuer into every token, however it was reached.
 
 For local development the `orderflow-cli` client allows the password grant, so tokens can be
 fetched with curl (`make token`). A browser application would use the authorization code
-flow with PKCE instead, and service-to-service calls would use client credentials.
+flow with PKCE instead.
+
+**Service accounts.** When a service acts on its own behalf (not for a user), it gets a token
+with the **client credentials** grant from its own confidential Keycloak client. The token is
+cached and renewed shortly before it expires:
+
+| Client | Role | Used for |
+|--------|------|----------|
+| `notification-service` | realm role `customer-reader` | reading customer profiles while handling events (there is no user token in an event) |
+| `customer-service` | `realm-management: view-users` | reading users from the Keycloak Admin API; it cannot change them |
+
+The client secrets come from `.env` (`NOTIFICATION_CLIENT_SECRET`, `CUSTOMER_CLIENT_SECRET`) and
+are substituted into the imported realm file by Keycloak (`${...}` placeholders).
+
+## gRPC between services
+
+The public API stays REST and JSON (simple for browsers and curl, stable for clients); inside,
+the gateway calls the services over gRPC. The contracts live in `proto/` (buf, `STANDARD` lint
+rules); the Go code in `gen/` is generated with `make proto` and committed.
+
+| Service | API | Methods | Called by |
+|---------|-----|---------|-----------|
+| Order | `orderflow.order.v1.OrderService` (`order:9081`) | `CreateOrder`, `GetOrder`, `ListOrders` | gateway |
+| Customer | `orderflow.customer.v1.CustomerService` (`customer:9085`) | `GetCustomer` | gateway, notification |
+
+Every server and client is built by `pkg/grpcx`, so they behave the same way:
+
+- **Interceptors.** Server: OpenTelemetry (continues the caller's trace), request ID from the
+  `x-request-id` metadata, a log line and RED metrics per call, panic recovery (`INTERNAL`
+  plus a GlitchTip report), a deadline cap, and token verification. Client: OpenTelemetry,
+  request ID propagation, metrics, a default deadline, and the token (`ForwardToken` for the
+  user's, `ServiceToken` for the service's own).
+- **Deadlines** travel with the call (`grpc-timeout`): the server stops working when the
+  caller stops waiting. A call without a deadline gets `*_GRPC_TIMEOUT` (5s); the server caps
+  any call at `REQUEST_TIMEOUT` (3s), so a server stuck on its database answers `UNAVAILABLE`
+  itself before the caller gives up.
+- **Retries** of `UNAVAILABLE`, up to 3 attempts with exponential backoff within the same
+  deadline, only for methods safe to repeat (`GetOrder`, `ListOrders`, `GetCustomer`), and only
+  when the call may not have reached a healthy server (connection refused or broken; with
+  `round_robin` the retry can go to another replica). When a service itself answers
+  `UNAVAILABLE` because its dependency is down, it sends `grpc-retry-pushback-ms: -1`, and the
+  client does not retry: the service has already waited for the dependency, and repeating
+  would multiply the load on it and use up the caller's deadline.
+  `CreateOrder` is not retried automatically: a repeat is safe only with an idempotency key,
+  which the client controls.
+- **Load balancing.** Connections use `round_robin` over all addresses of the name, and
+  servers close connections after `MaxConnectionAge` (30 min), so clients spread over new
+  replicas. Keepalive pings detect dead peers.
+- **Health checks.** The standard `grpc.health.v1.Health` service reports `SERVING` while the
+  database answers, and `NOT_SERVING` as soon as shutdown begins (then `GracefulStop`). It needs
+  no token, so load balancers and Kubernetes gRPC probes can use it.
+- **Errors** carry a `google.rpc.ErrorInfo` with a stable reason (`VALIDATION_FAILED`,
+  `IDEMPOTENCY_KEY_REUSED`, `DATABASE_UNAVAILABLE`, ...) and, for invalid fields, a
+  `google.rpc.BadRequest`. The gateway maps them to HTTP:
+
+  | gRPC | HTTP |
+  |------|------|
+  | `INVALID_ARGUMENT` | `422 validation_error` (or `idempotency_key_reused` by the reason) |
+  | `NOT_FOUND`, `PERMISSION_DENIED` | `404`, `403` |
+  | `UNAVAILABLE` with a reason (the service answered: its database is down) | `503` with `Retry-After` |
+  | `UNAVAILABLE` without a reason (the service could not be reached) | `502 upstream_unavailable` |
+  | `DEADLINE_EXCEEDED` | `504 upstream_timeout` |
+  | `INTERNAL` and the rest | `500` |
+
+- **Contract checks in CI:** `buf lint`, `buf format`, the generated code is up to date, and
+  `buf breaking` against the base branch of a pull request rejects changes that break existing
+  clients (a renamed field, a changed type or number). Locally: `make proto-breaking`.
+
+Traffic inside the Docker network is plaintext. In production it would be encrypted with TLS
+(or mTLS from a service mesh), and reflection would be off.
+
+## Customer Service
+
+Keycloak is the source of truth for identities; Customer Service keeps a **local copy** of
+each user it was asked about (`customers` table) and serves profiles from it:
+
+- a copy younger than `PROFILE_REFRESH_AFTER` (1h) is served as is;
+- an older one is refreshed from the Keycloak Admin API (a missing copy is fetched the same way);
+- if Keycloak is unavailable, the old copy is served (**stale**, with a warning) — emails keep
+  going out during a Keycloak outage; without a copy the answer is `UNAVAILABLE`;
+- a user deleted in Keycloak is deleted here too: the copy of their personal data does not outlive them.
+
+Calls to Keycloak have a timeout and a circuit breaker; Keycloak is not part of the service's
+health check, because the service stays useful without it. A customer sees only their own
+profile (another one is `NOT_FOUND`); `support` and the `customer-reader` role see all.
+`customer_lookups_total{result}` shows how often profiles are fresh, refreshed, or stale.
 
 ## API Gateway
 
@@ -235,7 +360,7 @@ applies the edge concerns to every request:
 - **Tracing at the edge.** The gateway starts a new trace for every request: a
   `traceparent` from the internet is only linked, never continued. Otherwise a client could
   attach requests to someone else's trace or force its traces to be sampled.
-- **Rate limiting** per client IP in Redis (GCRA, exact across gateway replicas):
+- **Rate limiting** per user in Redis (GCRA, exact across gateway replicas):
   `RATE_LIMIT_WRITE_*` for `POST`, `RATE_LIMIT_READ_*` for `GET`. Over the limit the
   client gets `429` with `Retry-After`.
 - **Idempotency.** A client can safely retry `POST /orders` (e.g., after a timeout) with
@@ -247,10 +372,11 @@ applies the edge concerns to every request:
   | Repeat after it | the stored response with `Idempotent-Replayed: true` |
   | Repeat while the first is in progress | `409` with `Retry-After: 1` |
   | Same key, different body | `422 idempotency_key_reused` |
-  | First request failed with 5xx | not stored, the client can retry |
+  | First request failed with 5xx, or the client disconnected | not stored, the client can retry |
 
-- **Timeouts.** An upstream that cannot be reached gets `502`, one that does not respond
-  within `UPSTREAM_TIMEOUT` gets `504`; the client never waits indefinitely.
+- **Deadlines.** A service that cannot be reached gets `502`, one that does not respond
+  within `ORDER_GRPC_TIMEOUT` / `CUSTOMER_GRPC_TIMEOUT` gets `504`; the client never waits
+  indefinitely. See [gRPC between services](#grpc-between-services) for the error mapping.
 
 **Redis is an accelerator, not a source of truth.** Every Redis call is bounded by
 `REDIS_OPERATION_TIMEOUT` (a hanging Redis is worse than a failed one), and on errors the
@@ -384,9 +510,10 @@ means the dependency works. Set `PAYMENT_STUB_ERROR_RATE=1` to see the payment b
 
 - Consumers check the database every `CONSUMER_HEALTH_INTERVAL` and **pause** while it is
   down: messages wait in the queue instead of failing and using up their retries.
-- HTTP requests get `503` with `Retry-After` instead of `500`: it is a temporary condition,
-  not a bug. Every request has a deadline (`REQUEST_TIMEOUT`, 3s) shorter than the gateway's
-  upstream timeout (5s), so the service answers before the gateway gives up.
+- API calls get `UNAVAILABLE` with the reason `DATABASE_UNAVAILABLE` (the gateway answers `503`
+  with `Retry-After`) instead of `INTERNAL`: it is a temporary condition, not a bug. Every call
+  is capped at `REQUEST_TIMEOUT` (3s), shorter than the gateway's deadline (5s), so the service
+  answers before the gateway gives up. Read methods are retried by the gRPC client.
 - Readiness (`/readyz`) fails, so an orchestrator stops routing traffic, but liveness
   (`/healthz`) does not, so it does not restart the service in a loop.
 
@@ -415,10 +542,11 @@ Prometheus scrapes the services and RabbitMQ's built-in exporter every 10 second
 | Group | Metrics |
 |-------|---------|
 | HTTP (RED) | `http_requests_total{method,route,status}`, `http_request_duration_seconds`, `http_requests_in_flight`. `route` is the chi pattern (`/api/v1/orders/{id}`), not the path: with raw paths every order ID would create new time series |
+| gRPC (RED) | `grpc_server_handled_total{grpc_service,grpc_method,grpc_code}`, `grpc_server_handling_seconds`, and `grpc_client_*` on the calling side (go-grpc-middleware); series are created for every method at startup |
 | Gateway | `gateway_rate_limit_decisions_total{policy,decision}`, `gateway_idempotency_requests_total{result}` |
 | Consumers | `messaging_consumed_messages_total{queue,event,result}` (ack, retry, dead_letter, requeue), `messaging_processing_duration_seconds`, `messaging_consumer_paused` |
 | Outbox | `outbox_published_messages_total`, `outbox_publish_errors_total`, `outbox_pending_messages`, `outbox_oldest_pending_age_seconds` (how late events are) |
-| Resilience | `circuit_breaker_state{name}` (0 closed, 1 half-open, 2 open), `order_cache_requests_total{result}` |
+| Resilience | `circuit_breaker_state{name}` (0 closed, 1 half-open, 2 open), `order_cache_requests_total{result}`, `customer_lookups_total{result}` |
 | Business | `orders_created_total`, `order_status_changes_total`, `payments_total{status,reason}`, `payment_amount_minor_units_total`, `shipments_registered_total`, `notifications_sent_total` |
 | RabbitMQ | queue depth per queue, including retry queues and DLQs (`rabbitmq_detailed_queue_messages`) |
 
@@ -431,7 +559,8 @@ Prometheus adapter, so the use cases do not depend on the metrics library.
 - **Business:** orders, payment success rate, revenue per currency, decline reasons,
   shipments by carrier, emails sent.
 - **Services:** health of every service, request rate, 5xx ratio, p95 latency, gateway
-  latency per route, rate limiter and idempotency decisions, cache hit ratio, circuit breakers.
+  latency per route, gRPC calls, error ratio and latency (server and client side), customer
+  profile lookups, rate limiter and idempotency decisions, cache hit ratio, circuit breakers.
 - **Messaging:** dead-lettered messages, outbox lag, paused consumers, retries, consumer
   throughput and latency, queue depth.
 
@@ -449,6 +578,7 @@ after a service starts) are not undercounted.
 |-------|------------|
 | `ServiceDown` | a service cannot be scraped for 1 minute |
 | `HighErrorRate` | more than 5% of a service's responses are 5xx for 5 minutes, with at least 50 requests per 5 minutes |
+| `GRPCServerErrors` | more than 5% of a gRPC service's calls fail on the server side (`Internal`, `Unavailable`, `DeadlineExceeded`, `Unknown`, `DataLoss`) for 5 minutes, with at least 50 calls per 5 minutes |
 | `SlowRequests` | p95 latency of a service is above 1s for 10 minutes, with at least 50 requests per 5 minutes |
 | `DeadLetterQueueNotEmpty` | a DLQ has messages; the description contains the `make dlq-list` command |
 | `OutboxLagging` | the oldest unpublished event is older than 60s (is RabbitMQ down?) |
@@ -465,12 +595,12 @@ Delivering alerts to Slack or email needs Alertmanager, which is not part of the
 
 ## Logs, traces, and errors
 
-One business flow (an order from `POST /orders` to the "shipped" email) crosses five
-services and three message hops. Three things tie it together:
+One business flow (an order from `POST /orders` to the "shipped" email) crosses six
+services, gRPC calls, and three message hops. Three things tie it together:
 
 - **Request ID.** The gateway generates `X-Request-Id` and returns it to the client; every
   service puts it into its logs (`request_id`).
-- **Trace context.** OpenTelemetry spans for HTTP, SQL (pgx), Redis, message publishing and
+- **Trace context.** OpenTelemetry spans for HTTP, gRPC, SQL (pgx), Redis, message publishing and
   processing, and external calls (payment provider, carrier, SMTP) form one trace.
 - **Propagation across the async boundary.** When an event is stored in the outbox, the
   current `traceparent` and request ID are saved in the `headers` column. The relay
@@ -478,7 +608,7 @@ services and three message hops. Three things tie it together:
   so the events it produces carry them on to the next service.
 
 ```
-gateway ──HTTP traceparent──▶ order ──outbox headers──▶ relay ──AMQP headers──▶ payment ──▶ ...
+gateway ──gRPC metadata──▶ order ──outbox headers──▶ relay ──AMQP headers──▶ payment ──▶ ...
 ```
 
 **Logs.** Services write JSON logs (`log/slog`) to stdout. Grafana Alloy reads them from
@@ -528,7 +658,6 @@ Then open the Logs dashboard with that request ID, and the `trace_id` link of an
 |------|----------|
 | Payment provider | random delay; declines a `PAYMENT_STUB_FAILURE_RATE` share of payments (`insufficient_funds`, `card_declined`, `card_expired`) — a business outcome, published as `payment.failed` |
 | Carrier | random delay; fails a `DELIVERY_STUB_ERROR_RATE` share of calls with a technical error — the consumer retries until it succeeds |
-| Customer directory | returns `customer-<first 8 chars of customer ID>@example.com` |
 | Email | real SMTP to [Mailpit](https://mailpit.axllent.org), which catches every email |
 
 Like real providers, the payment and carrier stubs are idempotent: the outcome (decline,
@@ -538,7 +667,7 @@ tracking number) is derived from the idempotency key, so a retry gets the same r
 
 | Level | What it covers | Run |
 |-------|----------------|-----|
-| Unit tests | authorization rules, token verification against a fake identity provider (real RSA signatures: expired, foreign key, wrong issuer or audience), use cases with fakes, HTTP and messaging adapters, the gateway with a real HTTP upstream and an in-memory Redis (miniredis), the cache and its Lua script, circuit breakers, header propagation | `make test` |
+| Unit tests | authorization rules, token verification against a fake identity provider (real RSA signatures: expired, foreign key, wrong issuer or audience), use cases with fakes, gRPC and messaging adapters, the gRPC interceptors on a real server (auth, deadlines, panics, health, request IDs), the gateway with fake gRPC services and an in-memory Redis (miniredis), the Keycloak adapter against a fake Admin API, the cache and its Lua script, circuit breakers, header propagation | `make test` |
 | Integration tests | real PostgreSQL and RabbitMQ in containers (testcontainers): SQL and constraints, concurrent duplicates on unique indexes (one payment, one email), and the full path outbox → relay → RabbitMQ → consumer → retry queue → DLQ, keeping the request ID and the trace | `make test-integration` |
 | Alert rules | `promtool test rules`: which alerts fire on synthetic series, with labels and annotations | `make test-alerts` |
 | Static analysis | golangci-lint: the standard linters plus error wrapping, closed rows and bodies, contexts in requests, gosec | `make lint` |
@@ -553,9 +682,10 @@ no Docker. They start the containers once per package and isolate tests by rando
 | `lint` | golangci-lint |
 | `test` | `go vet`, unit tests with the race detector |
 | `integration` | integration tests (Docker is available on GitHub runners) |
+| `proto` | `buf lint`, `buf format`, the generated code in `gen/` is up to date, and on pull requests `buf breaking` against the base branch |
 | `dashboards` | the committed dashboard JSON matches `cmd/dashboards` |
 | `config` | Docker Compose file, Prometheus config, alert rule unit tests (`promtool`), Alloy config |
-| `build` | Docker images of all five services |
+| `build` | Docker images of all six services |
 
 ## Configuration
 
@@ -568,7 +698,7 @@ Telemetry (all Go services):
 | `SENTRY_DSN`                   | — (reporting off) | GlitchTip or Sentry DSN                   |
 | `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE` | `development`, — | tags of error reports              |
 
-Authentication (gateway and Order Service):
+Authentication (gateway, Order and Customer Service):
 
 | Variable         | Default | Description |
 |------------------|---------|-------------|
@@ -576,20 +706,28 @@ Authentication (gateway and Order Service):
 | `OIDC_JWKS_URL`  | — (required) | where the signing keys are fetched (internal URL) |
 | `OIDC_AUDIENCE`  | `orderflow-api` | required `aud` of access tokens |
 
+gRPC (Order and Customer Service as servers; clients: `<SERVICE>_GRPC_*` in the gateway and Notification Service):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GRPC_ADDR` | `:9081` (order), `:9085` (customer) | gRPC listen address; `HTTP_ADDR` serves only metrics and probes |
+| `GRPC_REFLECTION` | `false` (`true` in compose) | lets grpcurl list the API; development only |
+| `REQUEST_TIMEOUT` | `3s` | the longest a call may run, whatever the caller's deadline |
+| `ORDER_GRPC_ADDR`, `CUSTOMER_GRPC_ADDR` | — (required) | the services' gRPC targets, e.g. `order:9081` |
+| `ORDER_GRPC_TIMEOUT`, `CUSTOMER_GRPC_TIMEOUT` | `5s` | deadline of a call, including its retries |
+
 API gateway:
 
 | Variable                    | Default  | Description                                    |
 |-----------------------------|----------|------------------------------------------------|
 | `HTTP_ADDR`                 | `:8080`  | listen address                                 |
-| `ORDER_SERVICE_URL`         | — (required) | Order Service base URL                     |
+| `ORDER_GRPC_ADDR`, `CUSTOMER_GRPC_ADDR` | — (required) | the services' gRPC APIs (see above) |
 | `REDIS_URL`                 | — (required) | `redis://:password@host:6379/0`            |
 | `REDIS_OPERATION_TIMEOUT`   | `300ms`  | one Redis call including dialing and retries   |
 | `REDIS_BREAKER_FAILURES`, `REDIS_BREAKER_OPEN_TIMEOUT` | `5`, `30s` | circuit breaker of Redis (also in Order Service) |
 | `REDIS_DIAL_TIMEOUT`, `REDIS_READ_TIMEOUT`, `REDIS_WRITE_TIMEOUT` | `500ms`, `200ms`, `200ms` | Redis client timeouts |
-| `UPSTREAM_TIMEOUT`          | `5s`     | whole upstream request                         |
-| `UPSTREAM_DIAL_TIMEOUT`     | `2s`     | connecting to the upstream                     |
-| `RATE_LIMIT_READ_RPS`, `RATE_LIMIT_READ_BURST`   | `50`, `100` | GET requests per second per client IP and burst |
-| `RATE_LIMIT_WRITE_RPS`, `RATE_LIMIT_WRITE_BURST` | `5`, `10`   | POST requests per second per client IP and burst |
+| `RATE_LIMIT_READ_RPS`, `RATE_LIMIT_READ_BURST`   | `50`, `100` | GET requests per second per user and burst |
+| `RATE_LIMIT_WRITE_RPS`, `RATE_LIMIT_WRITE_BURST` | `5`, `10`   | POST requests per second per user and burst |
 | `IDEMPOTENCY_TTL`           | `24h`    | how long a response is replayed                |
 | `IDEMPOTENCY_LOCK_TTL`      | `30s`    | lock of a request in progress (crash safety)   |
 | `LOG_LEVEL`, `SHUTDOWN_TIMEOUT` | `info`, `10s` | as in the services                     |
@@ -602,13 +740,12 @@ Order Service cache:
 | `REDIS_OPERATION_TIMEOUT` | `300ms` | one Redis call; on timeout the database is used      |
 | `CACHE_TTL`               | `5m`    | lifetime of a cached order (+ up to 10% jitter)      |
 | `CACHE_LOAD_TIMEOUT`      | `5s`    | a database load shared by concurrent misses          |
-| `REQUEST_TIMEOUT`         | `3s`    | deadline of every API request (shorter than the gateway's) |
 
 Common variables of the services:
 
 | Variable                    | Default            | Description                              |
 |-----------------------------|--------------------|------------------------------------------|
-| `HTTP_ADDR`                 | `:8081`–`:8084`    | listen address (order, payment, delivery, notification) |
+| `HTTP_ADDR`                 | `:8081`–`:8085`    | listen address (order, payment, delivery, notification, customer) |
 | `POSTGRES_DSN`              | — (required)       | PostgreSQL connection string             |
 | `RABBITMQ_URL`              | — (required)       | AMQP connection string                   |
 | `RABBITMQ_EXCHANGE`         | `orderflow.events` | topic exchange for integration events    |
@@ -650,20 +787,32 @@ Service-specific variables:
 | notification | `SMTP_TLS`                  | `false` | require STARTTLS                         |
 | notification | `SMTP_FROM`                 | `OrderFlow <noreply@orderflow.local>` | sender |
 | notification | `SMTP_TIMEOUT`              | `10s`   | timeout of one SMTP session              |
+| notification | `CUSTOMER_GRPC_ADDR`        | — (required) | the customer service                |
+| notification | `CUSTOMER_BREAKER_FAILURES`, `CUSTOMER_BREAKER_OPEN_TIMEOUT` | `5`, `30s` | circuit breaker of the customer service |
+| notification | `OIDC_TOKEN_URL`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | — (required) | its own Keycloak client (client credentials) |
+| customer     | `KEYCLOAK_URL`, `KEYCLOAK_REALM` | —, `orderflow` | Keycloak's internal address and realm |
+| customer     | `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | — (required) | its own Keycloak client (view-users) |
+| customer     | `KEYCLOAK_TIMEOUT`          | `2s`    | one Keycloak call                        |
+| customer     | `KEYCLOAK_BREAKER_FAILURES`, `KEYCLOAK_BREAKER_OPEN_TIMEOUT` | `5`, `30s` | circuit breaker of Keycloak |
+| customer     | `PROFILE_REFRESH_AFTER`     | `1h`    | age of a local copy before it is refreshed from Keycloak |
 
 ## Project structure
 
 ```
 cmd/<service>/                           entry points, configuration, dependency wiring
-internal/gateway/                        API gateway: routing, proxy, rate limiting, idempotency
+internal/gateway/                        API gateway: REST handlers over gRPC clients, rate limiting, idempotency
+proto/, buf.yaml, buf.gen.yaml           protobuf contracts of the gRPC APIs and their code generation
+gen/go/                                  generated protobuf and gRPC code (make proto)
+pkg/grpcx/                               gRPC servers and clients: interceptors, deadlines, retries, health, errors
 internal/<service>/domain/               business entities, domain events and errors
 internal/<service>/application/          use cases and ports
-internal/<service>/adapter/http/         HTTP delivery adapter
+internal/<service>/adapter/grpc/         gRPC delivery adapter (order, customer)
+internal/customer/adapter/keycloak/      Keycloak Admin API client (client credentials, circuit breaker)
 internal/<service>/adapter/messaging/    RabbitMQ delivery adapter (event handlers)
 internal/<service>/adapter/postgres/     PostgreSQL persistence adapter
 internal/<service>/adapter/provider/     external provider adapters: payment provider, carrier (stubs)
 internal/notification/adapter/smtp/      email delivery over SMTP
-internal/notification/adapter/customer/  customer directory (stub)
+internal/notification/adapter/customer/  gRPC client of the customer service
 pkg/                                     shared infrastructure: logger, HTTP helpers, shutdown
 pkg/outbox/                              transactional outbox: storing messages and the relay
 pkg/rabbitmq/                            RabbitMQ connection, publisher with confirms, consumer
@@ -689,7 +838,7 @@ internal/order/adapter/cache/            cache-aside decorator of the order repo
 migrations/<service>/                    SQL migrations per service (golang-migrate)
 ```
 
-The application layer depends on its ports and the domain, not on the HTTP, RabbitMQ,
+The application layer depends on its ports and the domain, not on the gRPC, RabbitMQ,
 or PostgreSQL adapters. The executable wires concrete adapters into the application service.
 
 Create a migration: `make migrate-new service=payment name=add_refunds`.

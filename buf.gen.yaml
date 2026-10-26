@@ -1,0 +1,18 @@
+# Go code generation for proto/ (run `make proto`). The plugins run remotely on the
+# Buf Schema Registry, so only Docker is needed locally; their versions are pinned to
+# match google.golang.org/protobuf and google.golang.org/grpc in go.mod.
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/elita001/order-microservices/gen/go
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.11
+    out: gen/go
+    opt: paths=source_relative
+  - remote: buf.build/grpc/go:v1.6.0
+    out: gen/go
+    opt: paths=source_relative
+inputs:
+  - directory: proto

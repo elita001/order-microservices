@@ -177,7 +177,7 @@
         "name": "service",
         "label": "Service",
         "skipUrlSync": false,
-        "query": "gateway,order,payment,delivery,notification",
+        "query": "gateway,order,customer,payment,delivery,notification",
         "current": {
           "selected": true,
           "text": [
@@ -190,7 +190,7 @@
         "multi": true,
         "allowCustomValue": true,
         "includeAll": true,
-        "allValue": "gateway|order|payment|delivery|notification",
+        "allValue": "gateway|order|customer|payment|delivery|notification",
         "auto": false,
         "auto_min": "10s",
         "auto_count": 30

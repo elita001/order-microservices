@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package orderflow.customer.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// CustomerService owns customer profiles. A customer is a user of the identity provider
+// (Keycloak): the customer ID is the user's ID, the "sub" claim of their access tokens.
+// The service keeps a local copy of each profile and refreshes it from Keycloak, so
+// callers keep working while Keycloak is unavailable.
+//
+// Every call must carry an access token in the "authorization" metadata ("Bearer <JWT>"):
+// a customer's own token, a support user's, or a service account token with the
+// customer-reader role (e.g., the notification service, which emails customers).
+// Errors carry a google.rpc.ErrorInfo detail with a stable reason (domain "customer.orderflow").
+//   INVALID_ARGUMENT   reason VALIDATION_FAILED
+//   NOT_FOUND          no such user, or the caller may not see them
+//   UNAVAILABLE        reason DIRECTORY_UNAVAILABLE or DATABASE_UNAVAILABLE: retry later
+service CustomerService {
+  // GetCustomer returns a customer's profile.
+  rpc GetCustomer(GetCustomerRequest) returns (GetCustomerResponse);
+}
+
+message Customer {
+  string id = 1;
+  string username = 2;
+  // Personal data: callers must not log it.
+  string email = 3;
+  string first_name = 4;
+  string last_name = 5;
+  // When the profile was last refreshed from the identity provider.
+  google.protobuf.Timestamp sync_time = 6;
+}
+
+message GetCustomerRequest {
+  string customer_id = 1;
+}
+
+message GetCustomerResponse {
+  Customer customer = 1;
+}
